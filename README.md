@@ -50,6 +50,14 @@ This does not replace the logical `display` domain or the Core
 `display-output` role. Its generic and optional method-specific contracts are
 documented in [`docs/ch347-control.md`](docs/ch347-control.md).
 
+CH347 `get_debug` adds bounded parsing of the sink's newest `dirty_stats`
+line. `sent_frames`, `zero_damage`, `full_refreshes`, `large_refreshes`,
+`sent_pixels`, `last_sent_pixels`, and `last_rects` are cumulative unsigned
+counters, not a sampled rate or delta.
+They are collected independently of the on-panel `DEBUG` overlay. An older
+sink with no statistics line, or a malformed/out-of-range newest line, returns
+`null` for every optional counter.
+
 The full API and selection rules are in
 [`docs/hal-contract-v1.md`](docs/hal-contract-v1.md). Linux behavior and its
 safety boundaries are in

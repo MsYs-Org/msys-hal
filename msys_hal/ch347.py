@@ -24,6 +24,7 @@ DEFAULT_TARGET = "org.msys.openstick.ch347:x11-spi-touch-output"
 MAX_CONFIG_BYTES = 16 * 1024
 MAX_LOG_TAIL_BYTES = 64 * 1024
 MAX_PID_ROWS = 32
+UINT64_MAX = 2**64 - 1
 
 FPS_KEYS = {
     "DEBUG": "debug_enabled",
@@ -44,6 +45,20 @@ DEBUG_SAMPLE_RE = re.compile(
     r"dirty=[0-9]{1,3}(?:\.[0-9]{1,3})?% "
     r"bus_fps=([0-9]{1,6}(?:\.[0-9]{1,3})?) "
     r"out_fps=([0-9]{1,6}(?:\.[0-9]{1,3})?)$"
+)
+DIRTY_STATS_FIELDS = (
+    "sent_frames",
+    "zero_damage",
+    "full_refreshes",
+    "large_refreshes",
+    "sent_pixels",
+    "last_sent_pixels",
+    "last_rects",
+)
+DIRTY_STATS_RE = re.compile(
+    r"^dirty_stats frame=(\S+) sent_frames=(\S+) zero_damage=(\S+) "
+    r"full_refreshes=(\S+) large_refreshes=(\S+) sent_pixels=(\S+) "
+    r"last_sent_pixels=(\S+) last_rects=(\S+)$"
 )
 PHYSICAL_ROTATIONS = ("normal", "right", "left", "inverted")
 ROTATION_RE = re.compile(
@@ -654,21 +669,29 @@ class Ch347ControlBackend:
         except (ProviderError, ValidationError) as exc:
             return None, exc.message if hasattr(exc, "message") else str(exc)
 
-    def _debug_sample(self) -> dict[str, Any] | None:
-        """Return only a real sink measurement from the current generation log."""
+    def _bounded_log_tail(self) -> tuple[str, ...]:
+        """Read a bounded, regular-file-only tail of the current sink log."""
 
         try:
             info = self.log_path.lstat()
             if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-                return None
+                return ()
             with self.log_path.open("rb") as stream:
                 stream.seek(0, os.SEEK_END)
                 size = stream.tell()
                 stream.seek(max(0, size - MAX_LOG_TAIL_BYTES), os.SEEK_SET)
                 data = stream.read(MAX_LOG_TAIL_BYTES)
         except OSError:
-            return None
-        for raw_line in reversed(data.decode("ascii", "ignore").splitlines()):
+            return ()
+        return tuple(data.decode("ascii", "replace").splitlines())
+
+    def _debug_sample(
+        self,
+        log_lines: tuple[str, ...],
+    ) -> dict[str, Any] | None:
+        """Return only a real sink measurement from the current generation log."""
+
+        for raw_line in reversed(log_lines):
             matched = DEBUG_SAMPLE_RE.fullmatch(raw_line.strip())
             if matched is None:
                 continue
@@ -696,6 +719,31 @@ class Ch347ControlBackend:
             }
         return None
 
+    def _dirty_stats_sample(
+        self,
+        log_lines: tuple[str, ...],
+    ) -> dict[str, int] | None:
+        """Return the newest cumulative sink counter snapshot, when valid."""
+
+        for raw_line in reversed(log_lines):
+            line = raw_line.strip()
+            if not line.startswith("dirty_stats "):
+                continue
+            matched = DIRTY_STATS_RE.fullmatch(line)
+            if matched is None:
+                return None
+            raw_counters = matched.groups()
+            if any(re.fullmatch(r"[0-9]+", value) is None for value in raw_counters):
+                return None
+            try:
+                counters = tuple(int(value, 10) for value in raw_counters)
+            except ValueError:
+                return None
+            if any(value < 0 or value > UINT64_MAX for value in counters):
+                return None
+            return dict(zip(DIRTY_STATS_FIELDS, counters[1:]))
+        return None
+
     def _debug_snapshot(
         self,
         configured: dict[str, Any],
@@ -719,7 +767,9 @@ class Ch347ControlBackend:
             and matches
         )
         enabled = bool(configured["debug_enabled"])
-        sample = self._debug_sample() if enabled and applied else None
+        log_lines = self._bounded_log_tail()
+        sample = self._debug_sample(log_lines) if enabled and applied else None
+        dirty_stats = self._dirty_stats_sample(log_lines)
         if config_error is not None:
             status = "unavailable"
             reason = "invalid-display-config"
@@ -755,6 +805,10 @@ class Ch347ControlBackend:
             "panel_fps": sample["panel_fps"] if sample is not None else None,
             "frames": sample["frames"] if sample is not None else None,
             "window_ms": sample["window_ms"] if sample is not None else None,
+            **{
+                field: dirty_stats[field] if dirty_stats is not None else None
+                for field in DIRTY_STATS_FIELDS
+            },
             "status": status,
             "reason": reason,
         }

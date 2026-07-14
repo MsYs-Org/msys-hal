@@ -40,6 +40,25 @@ def calibration_text(**overrides) -> str:
     ) + "\n"
 
 
+def dirty_stats_text(**overrides) -> str:
+    values = {
+        "frame": 100,
+        "sent_frames": 90,
+        "zero_damage": 10,
+        "full_refreshes": 2,
+        "large_refreshes": 3,
+        "sent_pixels": 456789,
+        "last_sent_pixels": 2048,
+        "last_rects": 4,
+    }
+    values.update(overrides)
+    return (
+        "dirty_stats "
+        + " ".join(f"{field}={values[field]}" for field in values)
+        + "\n"
+    )
+
+
 class FakeGateway:
     def __init__(self, *, present: bool = True, state: str = "ready") -> None:
         self.present = present
@@ -244,9 +263,101 @@ class Ch347ControlTests(unittest.TestCase):
         self.assertEqual(debug["panel_fps"], 1.25)
         self.assertEqual(debug["frames"], 20)
         self.assertIsNone(debug["window_ms"])
+        for field in (
+            "sent_frames",
+            "zero_damage",
+            "full_refreshes",
+            "large_refreshes",
+            "sent_pixels",
+            "last_sent_pixels",
+            "last_rects",
+        ):
+            self.assertIsNone(debug[field])
 
         with self.assertRaises(ValidationError):
             self.backend.set_state(DEVICE_ID, {"debug_enabled": 1})
+
+    def test_latest_dirty_stats_are_exposed_even_when_debug_is_disabled(self) -> None:
+        (self.run / "live.log").write_text(
+            dirty_stats_text(sent_frames=7, sent_pixels=1000)
+            + "unrelated sink output\n"
+            + dirty_stats_text(
+                frame=200,
+                sent_frames=180,
+                zero_damage=20,
+                full_refreshes=4,
+                large_refreshes=6,
+                sent_pixels=2**64 - 1,
+                last_sent_pixels=4096,
+                last_rects=8,
+            ),
+            encoding="ascii",
+        )
+
+        service = Ch347ControlService(
+            self.backend,
+            provider_id="org.msys.hal.linux:ch347-output-control",
+        )
+        debug = service.handle("get_debug", {})["debug"]
+
+        self.assertFalse(debug["enabled"])
+        self.assertEqual(debug["status"], "idle")
+        self.assertEqual(
+            {field: debug[field] for field in (
+                "sent_frames",
+                "zero_damage",
+                "full_refreshes",
+                "large_refreshes",
+                "sent_pixels",
+                "last_sent_pixels",
+                "last_rects",
+            )},
+            {
+                "sent_frames": 180,
+                "zero_damage": 20,
+                "full_refreshes": 4,
+                "large_refreshes": 6,
+                "sent_pixels": 2**64 - 1,
+                "last_sent_pixels": 4096,
+                "last_rects": 8,
+            },
+        )
+
+    def test_invalid_newest_dirty_stats_never_fall_back_to_stale_counters(self) -> None:
+        invalid_values = (
+            {"sent_frames": -1},
+            {"zero_damage": "not-a-number"},
+            {"sent_pixels": 2**64},
+            {"frame": 2**64},
+        )
+        for overrides in invalid_values:
+            with self.subTest(overrides=overrides):
+                (self.run / "live.log").write_text(
+                    dirty_stats_text() + dirty_stats_text(**overrides),
+                    encoding="ascii",
+                )
+                debug = self.backend.get_state(DEVICE_ID)["values"]["debug"]
+                for field in (
+                    "sent_frames",
+                    "zero_damage",
+                    "full_refreshes",
+                    "large_refreshes",
+                    "sent_pixels",
+                    "last_sent_pixels",
+                    "last_rects",
+                ):
+                    self.assertIsNone(debug[field])
+
+    def test_dirty_stats_outside_bounded_log_tail_are_not_read(self) -> None:
+        (self.run / "live.log").write_text(
+            dirty_stats_text() + ("unrelated sink output\n" * 4096),
+            encoding="ascii",
+        )
+
+        debug = self.backend.get_state(DEVICE_ID)["values"]["debug"]
+
+        self.assertIsNone(debug["sent_frames"])
+        self.assertIsNone(debug["sent_pixels"])
 
     def test_stopped_debug_write_is_saved_and_explicitly_requires_restart(self) -> None:
         self.gateway.state = "declared"

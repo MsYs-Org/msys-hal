@@ -121,6 +121,15 @@ the cumulative frame counter). Missing samples remain `null`; configured FPS
 is never presented as an observation. `window_ms` remains `null` because the
 sink does not publish a real sampling-window duration.
 
+The same `debug` object optionally contains the latest sink cumulative
+`dirty_stats` counters: `sent_frames`, `zero_damage`, `full_refreshes`,
+`large_refreshes`, `sent_pixels`, `last_sent_pixels`, and `last_rects`. HAL
+reads only the bounded log tail and accepts unsigned 64-bit decimal values.
+These counters are parsed even when the on-panel `DEBUG` overlay is disabled;
+they are never converted into rates, deltas, or an invented sampling window.
+Older sinks and malformed or out-of-range newest statistics return `null` for
+all seven fields.
+
 ## mIPC authorization note
 
 HAL manager discovery returns exact component identities and selection/probing
