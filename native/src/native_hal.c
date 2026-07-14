@@ -30,7 +30,7 @@
 #define O_NOFOLLOW 0
 #endif
 
-#define HAL_VERSION "0.2.7"
+#define HAL_VERSION "0.2.8"
 #define MANAGER_SCHEMA "org.msys.hal.manager.v1"
 #define NATIVE_SCHEMA "org.msys.hal.native-manager.v1"
 #define COMPONENT_ID "org.msys.hal.linux:native-manager"
@@ -1474,7 +1474,7 @@ static int write_i64_verified(const char *path, int64_t requested)
 typedef struct {
     char name[MAX_NAME + 1];
     int hard_blocked;
-    int powered;
+    int unblocked;
     int writable;
 } RadioPower;
 
@@ -1511,7 +1511,7 @@ static int radio_power(const char *domain, RadioPower *result)
         }
         memcpy(result->name, names[index], strlen(names[index]) + 1u);
         result->hard_blocked = hard != 0;
-        result->powered = soft == 0;
+        result->unblocked = soft == 0;
         result->writable = !result->hard_blocked && access(path, W_OK) == 0;
         return 1;
     }
@@ -1528,6 +1528,119 @@ static int set_radio_power(const char *domain, int powered)
         return 0;
     }
     return write_i64_verified(path, powered ? 0 : 1);
+}
+
+typedef struct {
+    int (*read_info)(const char *interface, BluetoothInfo *info);
+    int (*write_management)(const char *interface, int powered);
+    int (*read_rfkill)(const char *domain, RadioPower *state);
+    int (*write_rfkill)(const char *domain, int unblocked);
+    void (*wait_ms)(unsigned int milliseconds);
+} BluetoothPowerOps;
+
+static int bluetooth_management_index_missing(void)
+{
+    return strcmp(bluetooth_management_error, "index-list:0") == 0;
+}
+
+static void bluetooth_wait_ms(unsigned int milliseconds)
+{
+    struct timespec delay;
+    delay.tv_sec = (time_t)(milliseconds / 1000u);
+    delay.tv_nsec = (long)(milliseconds % 1000u) * 1000000L;
+    while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {
+    }
+}
+
+static int request_bluetooth_power_with(
+    const char *interface,
+    int powered,
+    const BluetoothPowerOps *ops
+)
+{
+    BluetoothInfo info;
+    RadioPower radio;
+    int attempt;
+
+    if (interface == NULL || ops == NULL || ops->read_info == NULL ||
+        ops->write_management == NULL || ops->read_rfkill == NULL ||
+        ops->write_rfkill == NULL || ops->wait_ms == NULL) {
+        return 0;
+    }
+
+    if (ops->read_info(interface, &info)) {
+        if (info.powered == powered) {
+            return 1;
+        }
+        if (!ops->write_management(interface, powered)) {
+            return 0;
+        }
+        if (!powered) {
+            /* Qualcomm WCNSS unregisters its Management index after a
+             * successful power-off.  Either an observable unpowered
+             * controller or that exact absence is a verified off state. */
+            if (ops->read_info(interface, &info)) {
+                return !info.powered;
+            }
+            return bluetooth_management_index_missing();
+        }
+        for (attempt = 0; attempt < 10; ++attempt) {
+            if (ops->read_info(interface, &info)) {
+                return info.powered;
+            }
+            ops->wait_ms(50u);
+        }
+        return 0;
+    }
+
+    if (!bluetooth_management_index_missing()) {
+        return 0;
+    }
+    if (!powered) {
+        /* No registered controller is an actual off state.  rfkill soft=0
+         * means only “not blocked” and must not override this fact. */
+        return 1;
+    }
+    if (!ops->read_rfkill("bluetooth", &radio) ||
+        radio.hard_blocked || !radio.writable) {
+        return 0;
+    }
+
+    /* An already-unblocked WCNSS with no Management index needs an edge, not
+     * another idempotent soft=0 write.  Bound the pulse and re-probe window. */
+    if (radio.unblocked) {
+        if (!ops->write_rfkill("bluetooth", 0)) {
+            return 0;
+        }
+        ops->wait_ms(100u);
+    }
+    if (!ops->write_rfkill("bluetooth", 1)) {
+        return 0;
+    }
+    for (attempt = 0; attempt < 20; ++attempt) {
+        if (ops->read_info(interface, &info)) {
+            if (info.powered) {
+                return 1;
+            }
+            if (!ops->write_management(interface, 1)) {
+                return 0;
+            }
+        }
+        ops->wait_ms(100u);
+    }
+    return 0;
+}
+
+static int request_bluetooth_power(const char *interface, int powered)
+{
+    static const BluetoothPowerOps operations = {
+        bluetooth_info,
+        set_bluetooth_power,
+        radio_power,
+        set_radio_power,
+        bluetooth_wait_ms,
+    };
+    return request_bluetooth_power_with(interface, powered, &operations);
 }
 
 static int compare_names(const void *left, const void *right)
@@ -1972,7 +2085,19 @@ static void append_inventory_device(JsonBuffer *buffer, const Device *device)
         if ((device->mutable & MUTABLE_ACTION) == 0) {
             buffer_append(
                 buffer,
-                ",\"management_reason\":\"linux-management-control-unavailable\""
+                bluetooth_management_index_missing()
+                    ? ",\"management_reason\":\"controller-not-registered\""
+                    : ",\"management_reason\":"
+                      "\"linux-management-control-unavailable\""
+            );
+            buffer_append(buffer, ",\"power_control\":");
+            buffer_string(
+                buffer,
+                (device->mutable & MUTABLE_STATE) != 0
+                    ? (bluetooth_management_index_missing()
+                        ? "rfkill-reprobe"
+                        : "rfkill")
+                    : "read-only"
             );
         }
         break;
@@ -2388,11 +2513,41 @@ static void append_radio_power_values(
     }
     *first = 0;
     buffer_append(buffer, "\"powered\":");
-    buffer_append(buffer, power.powered ? "true" : "false");
+    buffer_append(buffer, power.unblocked ? "true" : "false");
     buffer_append(buffer, ",\"hard_blocked\":");
     buffer_append(buffer, power.hard_blocked ? "true" : "false");
     buffer_append(buffer, ",\"power_control\":");
     buffer_string(buffer, power.writable ? "writable" : "read-only");
+}
+
+static void append_bluetooth_fallback_values(JsonBuffer *buffer)
+{
+    RadioPower radio;
+    int has_radio = radio_power("bluetooth", &radio);
+    if (bluetooth_management_index_missing()) {
+        buffer_append(buffer, ",\"powered\":false,\"power_state\":\"off\"");
+    } else {
+        buffer_append(buffer, ",\"powered\":null,\"power_state\":\"unknown\"");
+    }
+    if (!has_radio) {
+        buffer_append(buffer, ",\"power_control\":\"unavailable\"");
+        return;
+    }
+    buffer_append(buffer, ",\"hard_blocked\":");
+    buffer_append(buffer, radio.hard_blocked ? "true" : "false");
+    buffer_append(buffer, ",\"rfkill_unblocked\":");
+    buffer_append(buffer, radio.unblocked ? "true" : "false");
+    buffer_append(buffer, ",\"rfkill_soft_blocked\":");
+    buffer_append(buffer, radio.unblocked ? "false" : "true");
+    buffer_append(buffer, ",\"power_control\":");
+    buffer_string(
+        buffer,
+        radio.writable
+            ? (bluetooth_management_index_missing()
+                ? "rfkill-reprobe"
+                : "rfkill")
+            : "read-only"
+    );
 }
 
 static void append_wifi_values(JsonBuffer *buffer, const Device *device, int *first)
@@ -2563,13 +2718,19 @@ static int append_state(JsonBuffer *buffer, const Device *device, int persisted)
                 append_bluetooth_devices(buffer);
             } else {
                 append_text_value(buffer, device, "address", "address", &first);
-                append_radio_power_values(buffer, "bluetooth", &first);
+                append_bluetooth_fallback_values(buffer);
                 buffer_append(
                     buffer,
                     ",\"management_control\":\"unavailable\","
-                    "\"management_reason\":\"linux-management-control-unavailable\","
-                    "\"management_error\":"
+                    "\"management_reason\":"
                 );
+                buffer_string(
+                    buffer,
+                    bluetooth_management_index_missing()
+                        ? "controller-not-registered"
+                        : "linux-management-control-unavailable"
+                );
+                buffer_append(buffer, ",\"management_error\":");
                 buffer_string(buffer, bluetooth_management_error);
                 buffer_append(buffer, ",\"discovery_control\":\"unavailable\"");
             }
@@ -2582,8 +2743,15 @@ static int append_state(JsonBuffer *buffer, const Device *device, int persisted)
         append_integer_value(buffer, device, "hard", "hard_blocked", 0, 1, 1, &first);
         if (join_path(path, sizeof(path), device_root(device), device->name, "soft") &&
             read_i64_file(path, 0, 1, &brightness)) {
-            buffer_append(buffer, ",\"powered\":");
-            buffer_append(buffer, brightness == 0 ? "true" : "false");
+            if (device->kind == DEVICE_RFKILL_BLUETOOTH) {
+                buffer_append(buffer, ",\"powered\":null,\"rfkill_unblocked\":");
+                buffer_append(buffer, brightness == 0 ? "true" : "false");
+                buffer_append(buffer, ",\"rfkill_soft_blocked\":");
+                buffer_append(buffer, brightness == 0 ? "false" : "true");
+            } else {
+                buffer_append(buffer, ",\"powered\":");
+                buffer_append(buffer, brightness == 0 ? "true" : "false");
+            }
         }
         break;
     }
@@ -3106,19 +3274,8 @@ static int build_set_state(
             return 0;
         }
         if (device->kind == DEVICE_BLUETOOTH) {
-            BluetoothInfo info;
-            if (bluetooth_info(device->name, &info)) {
-                if (!set_bluetooth_power(device->name, powered_value)) {
-                    return -2;
-                }
-            } else {
-                if (!radio_power(device->domain, &power) ||
-                    power.hard_blocked || !power.writable) {
-                    return -3;
-                }
-                if (!set_radio_power(device->domain, powered_value)) {
-                    return -2;
-                }
+            if (!request_bluetooth_power(device->name, powered_value)) {
+                return -2;
             }
         } else {
             if (!radio_power(device->domain, &power) ||

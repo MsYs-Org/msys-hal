@@ -282,12 +282,14 @@ class RadioBackendTests(unittest.TestCase):
             controller = backend.get_state("bluetooth:hci0")
             self.assertFalse(controller["values"]["pairing_available"])
             self.assertEqual(controller["mutable"], ["powered"])
-            self.assertTrue(controller["values"]["powered"])
+            self.assertTrue(controller["values"]["rfkill_unblocked"])
+            self.assertEqual(controller["values"]["power_state"], "unknown")
+            self.assertIsNone(controller["values"]["powered"])
 
             off = backend.set_state("bluetooth:hci0", {"powered": False})
-            self.assertFalse(off["values"]["powered"])
+            self.assertFalse(off["values"]["rfkill_unblocked"])
             on = backend.set_state("bluetooth:rfkill0", {"powered": True})
-            self.assertTrue(on["values"]["powered"])
+            self.assertTrue(on["values"]["rfkill_unblocked"])
 
             write(radio / "hard", "1\n")
             with self.assertRaises(UnavailableError):

@@ -261,7 +261,7 @@ class NativeHalProtocolTests(unittest.TestCase):
         described = self._call("describe", {})
         self.assertEqual(described["type"], "return")
         self.assertEqual(described["payload"]["schema"], "org.msys.hal.native-manager.v1")
-        self.assertEqual(described["payload"]["provider"]["version"], "0.2.7")
+        self.assertEqual(described["payload"]["provider"]["version"], "0.2.8")
 
         first = self._call("inventory", {})["payload"]
         second = self._call("inventory", {})["payload"]
@@ -289,14 +289,25 @@ class NativeHalProtocolTests(unittest.TestCase):
         self.assertEqual(len(wifi["values"]["scan_results"]), 2)
         self.assertEqual(wifi["mutable"], ["powered", "action"])
 
+        # rfkill soft=0 means only unblocked. With no registered Management
+        # controller it must not be promoted to powered=true.
+        _write(self.roots["MSYS_HAL_RFKILL_ROOT"] / "rfkill0" / "soft", "0\n")
         bluetooth = self._call("get_state", {"id": "bluetooth:hci0"})["payload"]["state"]
         self.assertFalse(bluetooth["values"]["pairing_available"])
         self.assertEqual(bluetooth["values"]["pairing_reason"], "pairing-not-supported")
-        self.assertEqual(
+        self.assertIn(
             bluetooth["values"]["management_reason"],
-            "linux-management-control-unavailable",
+            {
+                "controller-not-registered",
+                "linux-management-control-unavailable",
+            },
         )
         self.assertEqual(bluetooth["values"]["discovery_control"], "unavailable")
+        self.assertTrue(bluetooth["values"]["rfkill_unblocked"])
+        self.assertIsNot(bluetooth["values"].get("powered"), True)
+        if bluetooth["values"]["management_reason"] == "controller-not-registered":
+            self.assertFalse(bluetooth["values"]["powered"])
+            self.assertEqual(bluetooth["values"]["power_state"], "off")
 
         providers = self._call("list_providers", {"domain": "backlight"})["payload"]
         self.assertEqual(
@@ -323,7 +334,11 @@ class NativeHalProtocolTests(unittest.TestCase):
             "set_state",
             {"id": "bluetooth:rfkill0", "changes": {"powered": True}},
         )
-        self.assertEqual(bluetooth["payload"]["state"]["values"]["powered"], True)
+        self.assertEqual(
+            bluetooth["payload"]["state"]["values"]["rfkill_unblocked"],
+            True,
+        )
+        self.assertIsNone(bluetooth["payload"]["state"]["values"]["powered"])
         self.assertEqual(
             (self.roots["MSYS_HAL_RFKILL_ROOT"] / "rfkill0" / "soft")
             .read_text(encoding="ascii")
@@ -409,7 +424,7 @@ class NativeHalProtocolTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         report = json.loads(completed.stdout)
-        self.assertEqual(report["version"], "0.2.7")
+        self.assertEqual(report["version"], "0.2.8")
         self.assertTrue(report["ok"])
         self.assertTrue(report["wifi_control"])
         self.assertGreaterEqual(report["devices"], 8)
@@ -417,7 +432,7 @@ class NativeHalProtocolTests(unittest.TestCase):
 
 
 class NativeMgmtProtocolUnitTests(unittest.TestCase):
-    def test_command_complete_response_can_be_explicitly_discarded(self) -> None:
+    def test_management_frames_and_wcnss_power_recovery(self) -> None:
         compiler = shutil.which("cc")
         sdk = Path(os.environ.get("MSYS_SDK_DIR", WORKSPACE / "msys-sdk"))
         if compiler is None or not (sdk / "src" / "mipc.c").is_file():

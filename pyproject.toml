@@ -1,6 +1,6 @@
 [project]
 name = "msys-hal"
-version = "0.2.7"
+version = "0.2.8"
 description = "Replaceable, dependency-free hardware abstraction services for MSYS"
 requires-python = ">=3.10"
 dependencies = []

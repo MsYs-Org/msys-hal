@@ -1,4 +1,4 @@
-# Native HAL host 0.2.7
+# Native HAL host 0.2.8
 
 files/bin/msys-hal-native is the first dependency-free native replacement for
 the always-resident Python HAL graph. It is one C11 process linked directly
@@ -62,6 +62,18 @@ native parser validates the packet length and command status, records the
 actual response length, and safely discards the body only when the caller
 passes no output buffer. This is required by `Set Powered`, whose successful
 response contains the four-byte updated settings mask.
+
+Some integrated controllers unregister their Management index after a
+successful Set Powered(false). The native HAL treats that exact empty index
+list as a verified off state. Set Powered(true) then creates one rfkill
+block/unblock edge when the radio was already unblocked, and polls for the
+controller with at most 20 attempts separated by 100 milliseconds. Other Management failures are not
+misclassified and do not trigger the recovery path.
+
+rfkill is an administrative block, not a hardware power sensor. Bluetooth
+state therefore exposes `rfkill_unblocked` and `rfkill_soft_blocked`
+separately. A soft value of zero is never returned as `powered:true` unless
+Management itself reports the powered setting.
 
 The manager contract reports its fixed built-in provider as the active
 automatic choice. It never emits a private `selection` enum, so generic clients

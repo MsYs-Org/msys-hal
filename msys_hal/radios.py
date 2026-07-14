@@ -584,11 +584,12 @@ class BluetoothBackend:
         if name:
             values["radio_name"] = name[:128]
         if soft is not None:
-            values["soft_blocked"] = bool(soft)
+            values["rfkill_soft_blocked"] = bool(soft)
+            values["rfkill_unblocked"] = not bool(soft)
         if hard is not None:
             values["hard_blocked"] = bool(hard)
-        if soft is not None or hard is not None:
-            values["powered"] = not bool(soft) and not bool(hard)
+        values["powered"] = None
+        values["power_state"] = "unknown"
         return values
 
     def _radio_for_controller(self, name: str) -> Path | None:
@@ -608,7 +609,8 @@ class BluetoothBackend:
                 "kind": "controller",
                 "pairing_available": False,
                 "pairing_reason": "no-supported-bluetooth-control-channel",
-                "power_control": "available" if radio and self.writable(radio / "soft") else "unavailable",
+                "power_control": "rfkill" if radio and self.writable(radio / "soft") else "unavailable",
+                "power_state": "unknown",
             }
             if address and MAC_RE.fullmatch(address):
                 metadata["address"] = address.casefold()
@@ -680,6 +682,6 @@ class BluetoothBackend:
         except OSError as exc:
             raise ProviderError("Bluetooth soft-block write failed", details={"id": identifier}) from exc
         after = self._radio_values(radio)
-        if after.get("powered") is not requested:
+        if after.get("rfkill_unblocked") is not requested:
             raise ProviderError("Bluetooth soft-block write could not be verified", details={"id": identifier})
         return self.get_state(identifier)
