@@ -14,7 +14,7 @@ status and Bluetooth radio status. A board-specific native provider is an
 ordinary language-neutral MSYS package and may outrank or be selected instead
 of one reference domain.
 
-Version 0.2.5 uses the single-process C11 native manager as the normal resident
+Version 0.2.7 uses the single-process C11 native manager as the normal resident
 HAL and retains the Python manager/providers as idle-reaped on-demand
 fallbacks. Its phase-one hardware and compatibility boundaries, strict write
 allowlist, build, aarch64 smoke test, and RSS measurement are documented in
@@ -22,11 +22,19 @@ allowlist, build, aarch64 smoke test, and RSS measurement are documented in
 
 The radio providers are intentionally narrow. Wi-Fi talks directly to an
 already-running wpa_supplicant control socket with bounded standard-library
-Unix datagrams; it never invokes `wpa_cli`. Bluetooth observes kernel classes
-and controls only a verified rfkill soft block. Pairing is reported as
-unavailable until a replaceable provider supplies a real, supervised Bluetooth
-control channel. Neither provider requires NetworkManager, BlueZ D-Bus or a
-target package manager.
+Unix datagram in Python and the same protocol directly in the native manager;
+it never invokes `wpa_cli`. The native manager uses the stable Linux Bluetooth
+Management socket for controller state, power and a bounded discovery scan,
+with rfkill as the verified power fallback. Pairing remains explicitly
+unsupported until a replaceable provider supplies a complete pairing contract;
+it is never simulated. Missing controllers, control sockets and Management
+support are returned as structured unavailable/reason fields. Neither path
+requires NetworkManager, BlueZ D-Bus or a target package manager.
+
+Version 0.2.7 also accepts the standard four-byte `current_settings` response
+from Linux Management power commands when the caller intentionally discards
+the response body. The command is still status-checked and bounded; a
+successful kernel power transition no longer becomes a false internal error.
 
 The OpenStick integration also supplies a distinct `display-output` HAL domain
 for the package-owned CH347 FPS/touch configuration and supervised restart.

@@ -261,7 +261,7 @@ class NativeHalProtocolTests(unittest.TestCase):
         described = self._call("describe", {})
         self.assertEqual(described["type"], "return")
         self.assertEqual(described["payload"]["schema"], "org.msys.hal.native-manager.v1")
-        self.assertEqual(described["payload"]["provider"]["version"], "0.2.5")
+        self.assertEqual(described["payload"]["provider"]["version"], "0.2.7")
 
         first = self._call("inventory", {})["payload"]
         second = self._call("inventory", {})["payload"]
@@ -291,6 +291,11 @@ class NativeHalProtocolTests(unittest.TestCase):
 
         bluetooth = self._call("get_state", {"id": "bluetooth:hci0"})["payload"]["state"]
         self.assertFalse(bluetooth["values"]["pairing_available"])
+        self.assertEqual(bluetooth["values"]["pairing_reason"], "pairing-not-supported")
+        self.assertEqual(
+            bluetooth["values"]["management_reason"],
+            "linux-management-control-unavailable",
+        )
         self.assertEqual(bluetooth["values"]["discovery_control"], "unavailable")
 
         providers = self._call("list_providers", {"domain": "backlight"})["payload"]
@@ -404,11 +409,51 @@ class NativeHalProtocolTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         report = json.loads(completed.stdout)
-        self.assertEqual(report["version"], "0.2.5")
+        self.assertEqual(report["version"], "0.2.7")
         self.assertTrue(report["ok"])
         self.assertTrue(report["wifi_control"])
         self.assertGreaterEqual(report["devices"], 8)
         self.assertGreater(report["rss_kib"], 0)
+
+
+class NativeMgmtProtocolUnitTests(unittest.TestCase):
+    def test_command_complete_response_can_be_explicitly_discarded(self) -> None:
+        compiler = shutil.which("cc")
+        sdk = Path(os.environ.get("MSYS_SDK_DIR", WORKSPACE / "msys-sdk"))
+        if compiler is None or not (sdk / "src" / "mipc.c").is_file():
+            self.skipTest("native C compiler or adjacent msys-sdk source is unavailable")
+        with tempfile.TemporaryDirectory() as temporary:
+            binary = Path(temporary) / "native-mgmt-protocol-test"
+            completed = subprocess.run(
+                [
+                    compiler,
+                    "-I",
+                    str(sdk / "include"),
+                    "-O2",
+                    "-std=c11",
+                    "-Wall",
+                    "-Wextra",
+                    "-Wpedantic",
+                    "-Werror",
+                    str(ROOT / "tests" / "native_mgmt_protocol_test.c"),
+                    str(sdk / "src" / "mipc.c"),
+                    "-o",
+                    str(binary),
+                ],
+                text=True,
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+            executed = subprocess.run(
+                [str(binary)],
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+            self.assertEqual(executed.returncode, 0, executed.stdout + executed.stderr)
 
 
 if __name__ == "__main__":

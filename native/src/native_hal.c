@@ -30,7 +30,7 @@
 #define O_NOFOLLOW 0
 #endif
 
-#define HAL_VERSION "0.2.5"
+#define HAL_VERSION "0.2.7"
 #define MANAGER_SCHEMA "org.msys.hal.manager.v1"
 #define NATIVE_SCHEMA "org.msys.hal.native-manager.v1"
 #define COMPONENT_ID "org.msys.hal.linux:native-manager"
@@ -1164,7 +1164,11 @@ static int receive_mgmt_event(
     }
     if (event == MGMT_EV_CMD_COMPLETE) {
         size_t data_length = (size_t)payload_length - 3u;
-        if (data_length > response_capacity) {
+        /* Some successful commands, notably Set Powered, always return the
+         * updated settings word.  Callers that pass response == NULL are
+         * explicitly discarding that bounded response, not advertising a
+         * zero-byte receive buffer. */
+        if (response != NULL && data_length > response_capacity) {
             return -1;
         }
         if (response != NULL && data_length > 0u) {
@@ -1940,15 +1944,37 @@ static void append_inventory_device(JsonBuffer *buffer, const Device *device)
                 (device->mutable & MUTABLE_ACTION) != 0 ? "available" : "unavailable"
             );
             buffer_append(buffer, "\"");
+            if ((device->mutable & MUTABLE_ACTION) == 0) {
+                buffer_append(
+                    buffer,
+                    ",\"wifi_control_reason\":"
+                    "\"wpa-supplicant-control-unavailable\""
+                );
+            }
         }
         break;
     case DEVICE_BLUETOOTH:
-        buffer_append(buffer, "\"kind\":\"controller\",\"discovery_control\":");
+        buffer_append(buffer, "\"kind\":\"controller\",\"management_control\":");
         buffer_string(
             buffer,
             (device->mutable & MUTABLE_ACTION) != 0 ? "available" : "unavailable"
         );
-        buffer_append(buffer, ",\"pairing_control\":\"unavailable\"");
+        buffer_append(buffer, ",\"discovery_control\":");
+        buffer_string(
+            buffer,
+            (device->mutable & MUTABLE_ACTION) != 0 ? "available" : "unavailable"
+        );
+        buffer_append(
+            buffer,
+            ",\"pairing_control\":\"unsupported\","
+            "\"pairing_reason\":\"pairing-not-supported\""
+        );
+        if ((device->mutable & MUTABLE_ACTION) == 0) {
+            buffer_append(
+                buffer,
+                ",\"management_reason\":\"linux-management-control-unavailable\""
+            );
+        }
         break;
     case DEVICE_RFKILL_NETWORK:
     case DEVICE_RFKILL_BLUETOOTH:
@@ -2380,14 +2406,22 @@ static void append_wifi_values(JsonBuffer *buffer, const Device *device, int *fi
     }
     *first = 0;
     if (!wpa_available(device->name)) {
-        buffer_append(buffer, "\"wifi_control\":\"unavailable\"");
+        buffer_append(
+            buffer,
+            "\"wifi_control\":\"unavailable\","
+            "\"wifi_control_reason\":\"wpa-supplicant-control-unavailable\""
+        );
         return;
     }
     response = (char *)malloc(WPA_RESPONSE_CAPACITY);
     if (response == NULL ||
         !wpa_request(device->name, "STATUS", response, WPA_RESPONSE_CAPACITY) ||
         strncmp(response, "FAIL", 4u) == 0) {
-        buffer_append(buffer, "\"wifi_control\":\"degraded\"");
+        buffer_append(
+            buffer,
+            "\"wifi_control\":\"degraded\","
+            "\"wifi_control_reason\":\"wpa-supplicant-control-request-failed\""
+        );
         free(response);
         return;
     }
@@ -2508,7 +2542,7 @@ static int append_state(JsonBuffer *buffer, const Device *device, int persisted)
             buffer_append(
                 buffer,
                 "\"kind\":\"controller\",\"pairing_available\":false,"
-                "\"pairing_reason\":\"pairing-not-implemented\""
+                "\"pairing_reason\":\"pairing-not-supported\""
             );
             first = 0;
             if (bluetooth_info(device->name, &info)) {
@@ -2523,12 +2557,20 @@ static int append_state(JsonBuffer *buffer, const Device *device, int persisted)
                 buffer_append(
                     buffer,
                     ",\"hard_blocked\":false,\"power_control\":\"management\","
+                    "\"management_control\":\"available\","
                     "\"discovery_control\":\"available\",\"discovered_devices\":"
                 );
                 append_bluetooth_devices(buffer);
             } else {
                 append_text_value(buffer, device, "address", "address", &first);
                 append_radio_power_values(buffer, "bluetooth", &first);
+                buffer_append(
+                    buffer,
+                    ",\"management_control\":\"unavailable\","
+                    "\"management_reason\":\"linux-management-control-unavailable\","
+                    "\"management_error\":"
+                );
+                buffer_string(buffer, bluetooth_management_error);
                 buffer_append(buffer, ",\"discovery_control\":\"unavailable\"");
             }
         }

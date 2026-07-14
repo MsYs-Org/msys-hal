@@ -1,4 +1,4 @@
-# Native HAL host 0.2.5
+# Native HAL host 0.2.7
 
 files/bin/msys-hal-native is the first dependency-free native replacement for
 the always-resident Python HAL graph. It is one C11 process linked directly
@@ -48,8 +48,20 @@ Only two write paths exist:
 All other state changes return HAL_READ_ONLY or HAL_UNSUPPORTED. Wi-Fi scan,
 association, disconnect, saved-profile removal, and rfkill power are supported
 through the wpa_supplicant control socket and Linux class files without D-Bus.
-Bluetooth discovery/pairing, display layout, switching to an external provider,
-and long-poll event journaling remain outside phase one.
+Bluetooth discovery uses the Linux Management control channel with a bounded
+1.8-second scan and at most 24 results. Pairing, display layout, switching to an
+external provider, and long-poll event journaling remain outside phase one.
+Pairing is reported as unsupported rather than being simulated. If Wi-Fi's
+wpa_supplicant socket or Bluetooth's Management channel is missing, inventory
+and state include stable reason fields while preserving any read-only sysfs
+inventory that is still real.
+
+Linux Management Command Complete packets may carry a command-specific
+response even when the operation caller does not need that response. The
+native parser validates the packet length and command status, records the
+actual response length, and safely discards the body only when the caller
+passes no output buffer. This is required by `Set Powered`, whose successful
+response contains the four-byte updated settings mask.
 
 The manager contract reports its fixed built-in provider as the active
 automatic choice. It never emits a private `selection` enum, so generic clients
