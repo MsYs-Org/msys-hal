@@ -1,0 +1,25 @@
+{
+  "schema": "msys.manifest.v1",
+  "package": {
+    "id": "org.example.board-hal",
+    "name": "Example Board HAL",
+    "version": "1.0.0",
+    "kind": "driver"
+  },
+  "components": [
+    {
+      "id": "power-provider",
+      "runtime": "native",
+      "exec": ["files/bin/board-hal-power"],
+      "lifecycle": "on-demand",
+      "restart": "on-failure",
+      "readiness": {"mode": "mipc-ready", "timeout_ms": 3000},
+      "provides": [
+        {"interface": "org.msys.hal.provider.v1", "exclusive": false, "priority": 200},
+        {"capability": "hal.power", "exclusive": false, "priority": 200}
+      ],
+      "permissions": ["device:board-power-controller"]
+    }
+  ]
+}
+

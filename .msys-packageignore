@@ -1,0 +1,9 @@
+.gitignore
+README.md
+docs/
+examples/
+manifests/
+native/
+scripts/
+tests/
+pyproject.toml

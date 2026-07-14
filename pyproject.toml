@@ -1,0 +1,11 @@
+[project]
+name = "msys-hal"
+version = "0.2.5"
+description = "Replaceable, dependency-free hardware abstraction services for MSYS"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+msys-hal-manager = "msys_hal.manager:main"
+msys-hal-linux-provider = "msys_hal.provider:main"
+msys-hal-ch347-control = "msys_hal.ch347:main"
