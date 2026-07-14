@@ -38,6 +38,7 @@ static int fake_hard_blocked;
 static int fake_rfkill_unblocked;
 static int fake_rfkill_writes[4];
 static size_t fake_rfkill_write_count;
+static unsigned int fake_bring_up_calls;
 static unsigned int fake_wait_total_ms;
 
 static int fake_read_info(const char *interface, BluetoothInfo *info)
@@ -94,9 +95,17 @@ static int fake_write_rfkill(const char *domain, int unblocked)
     fake_rfkill_unblocked = unblocked;
     if (!unblocked) {
         fake_controller = FAKE_CONTROLLER_MISSING;
-    } else {
-        fake_controller = FAKE_CONTROLLER_OFF;
     }
+    return 1;
+}
+
+static int fake_bring_up(const char *interface)
+{
+    fake_bring_up_calls++;
+    if (strcmp(interface, "hci0") != 0 || !fake_rfkill_unblocked) {
+        return 0;
+    }
+    fake_controller = FAKE_CONTROLLER_OFF;
     return 1;
 }
 
@@ -112,6 +121,7 @@ static void reset_fake(enum fake_controller_state controller, int unblocked)
     fake_rfkill_unblocked = unblocked;
     memset(fake_rfkill_writes, 0, sizeof(fake_rfkill_writes));
     fake_rfkill_write_count = 0u;
+    fake_bring_up_calls = 0u;
     fake_wait_total_ms = 0u;
     (void)snprintf(
         bluetooth_management_error,
@@ -128,6 +138,7 @@ int main(void)
         fake_write_management,
         fake_read_rfkill,
         fake_write_rfkill,
+        fake_bring_up,
         fake_wait,
     };
     int sockets[2];
@@ -220,14 +231,15 @@ int main(void)
         fake_controller != FAKE_CONTROLLER_ON ||
         fake_rfkill_write_count != 2u ||
         fake_rfkill_writes[0] != 0 || fake_rfkill_writes[1] != 1 ||
-        fake_wait_total_ms < 100u) {
+        fake_bring_up_calls != 1u || fake_wait_total_ms < 200u) {
         return 9;
     }
 
     reset_fake(FAKE_CONTROLLER_MISSING, 0);
     if (!request_bluetooth_power_with("hci0", 1, &fake_operations) ||
         fake_controller != FAKE_CONTROLLER_ON ||
-        fake_rfkill_write_count != 1u || fake_rfkill_writes[0] != 1) {
+        fake_rfkill_write_count != 1u || fake_rfkill_writes[0] != 1 ||
+        fake_bring_up_calls != 1u) {
         return 10;
     }
 

@@ -1,4 +1,4 @@
-# Native HAL host 0.2.8
+# Native HAL host 0.2.9
 
 files/bin/msys-hal-native is the first dependency-free native replacement for
 the always-resident Python HAL graph. It is one C11 process linked directly
@@ -69,6 +69,12 @@ list as a verified off state. Set Powered(true) then creates one rfkill
 block/unblock edge when the radio was already unblocked, and polls for the
 controller with at most 20 attempts separated by 100 milliseconds. Other Management failures are not
 misclassified and do not trigger the recovery path.
+
+On the OpenStick WCNSS kernel, rfkill unblock alone leaves the existing
+`hciN` device down and absent from the Management index. The recovery path
+therefore issues the standard Linux `HCIDEVUP` ioctl for that bounded device
+name before polling Management. It uses no BlueZ library or command-line tool;
+failure remains a truthful `HAL_UNAVAILABLE` result.
 
 rfkill is an administrative block, not a hardware power sensor. Bluetooth
 state therefore exposes `rfkill_unblocked` and `rfkill_soft_blocked`
