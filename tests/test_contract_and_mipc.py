@@ -28,7 +28,7 @@ class ContractAndMipcTests(unittest.TestCase):
         self.assertEqual(canonical, development)
         manifest = canonical
         self.assertEqual(manifest["schema"], "msys.manifest.v1")
-        self.assertEqual(__version__, "0.2.9")
+        self.assertEqual(__version__, "0.2.11")
         self.assertEqual(manifest["package"]["version"], __version__)
         pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
         project_version = re.search(

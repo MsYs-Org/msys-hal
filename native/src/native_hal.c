@@ -31,7 +31,7 @@
 #define O_NOFOLLOW 0
 #endif
 
-#define HAL_VERSION "0.2.9"
+#define HAL_VERSION "0.2.11"
 #define MANAGER_SCHEMA "org.msys.hal.manager.v1"
 #define NATIVE_SCHEMA "org.msys.hal.native-manager.v1"
 #define COMPONENT_ID "org.msys.hal.linux:native-manager"
@@ -57,7 +57,6 @@
 #define MSYS_BTPROTO_HCI 1
 #define MSYS_HCI_DEV_NONE 0xffffu
 #define MSYS_HCI_CHANNEL_CONTROL 3u
-#define MSYS_HCIDEVUP _IOW('H', 201, int)
 #define MGMT_EV_CMD_COMPLETE 0x0001u
 #define MGMT_EV_CMD_STATUS 0x0002u
 #define MGMT_EV_DEVICE_FOUND 0x0012u
@@ -1537,7 +1536,6 @@ typedef struct {
     int (*write_management)(const char *interface, int powered);
     int (*read_rfkill)(const char *domain, RadioPower *state);
     int (*write_rfkill)(const char *domain, int unblocked);
-    int (*bring_up)(const char *interface);
     void (*wait_ms)(unsigned int milliseconds);
 } BluetoothPowerOps;
 
@@ -1555,34 +1553,6 @@ static void bluetooth_wait_ms(unsigned int milliseconds)
     }
 }
 
-static int bluetooth_hci_device_up(const char *interface)
-{
-    char *end = NULL;
-    unsigned long value;
-    int descriptor;
-    int saved_errno;
-    int result;
-
-    if (interface == NULL || strncmp(interface, "hci", 3u) != 0 ||
-        !isdigit((unsigned char)interface[3])) {
-        return 0;
-    }
-    errno = 0;
-    value = strtoul(interface + 3, &end, 10);
-    if (errno != 0 || end == interface + 3 || *end != '\0' || value > INT_MAX) {
-        return 0;
-    }
-    descriptor = socket(MSYS_AF_BLUETOOTH, SOCK_RAW, MSYS_BTPROTO_HCI);
-    if (descriptor < 0) {
-        return 0;
-    }
-    (void)fcntl(descriptor, F_SETFD, FD_CLOEXEC);
-    result = ioctl(descriptor, MSYS_HCIDEVUP, (int)value);
-    saved_errno = errno;
-    (void)close(descriptor);
-    return result == 0 || saved_errno == EALREADY;
-}
-
 static int request_bluetooth_power_with(
     const char *interface,
     int powered,
@@ -1595,8 +1565,7 @@ static int request_bluetooth_power_with(
 
     if (interface == NULL || ops == NULL || ops->read_info == NULL ||
         ops->write_management == NULL || ops->read_rfkill == NULL ||
-        ops->write_rfkill == NULL || ops->bring_up == NULL ||
-        ops->wait_ms == NULL) {
+        ops->write_rfkill == NULL || ops->wait_ms == NULL) {
         return 0;
     }
 
@@ -1649,18 +1618,19 @@ static int request_bluetooth_power_with(
     if (!ops->write_rfkill("bluetooth", 1)) {
         return 0;
     }
-    /* WCNSS keeps the sysfs hci device after Management Set Powered(false),
-     * but a rfkill unblock alone does not re-register its Management index on
-     * the OpenStick kernel. HCIDEVUP is the dependency-free kernel ABI for
-     * bringing that existing controller back before the bounded MGMT probe. */
-    ops->wait_ms(100u);
-    (void)ops->bring_up(interface);
-    for (attempt = 0; attempt < 20; ++attempt) {
+    /* Let the kernel's rfkill callback run hci_power_on.  A legacy HCIDEVUP
+     * during HCI_SETUP initializes address/features without clearing the
+     * setup flag, which permanently hides this controller from MGMT. */
+    for (attempt = 0; attempt < 50; ++attempt) {
         if (ops->read_info(interface, &info)) {
             if (info.powered) {
                 return 1;
             }
             if (!ops->write_management(interface, 1)) {
+                return 0;
+            }
+        } else {
+            if (!bluetooth_management_index_missing()) {
                 return 0;
             }
         }
@@ -1676,7 +1646,6 @@ static int request_bluetooth_power(const char *interface, int powered)
         set_bluetooth_power,
         radio_power,
         set_radio_power,
-        bluetooth_hci_device_up,
         bluetooth_wait_ms,
     };
     return request_bluetooth_power_with(interface, powered, &operations);

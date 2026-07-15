@@ -38,13 +38,20 @@ static int fake_hard_blocked;
 static int fake_rfkill_unblocked;
 static int fake_rfkill_writes[4];
 static size_t fake_rfkill_write_count;
-static unsigned int fake_bring_up_calls;
+static unsigned int fake_read_info_calls;
+static unsigned int fake_registration_after_reads;
 static unsigned int fake_wait_total_ms;
 
 static int fake_read_info(const char *interface, BluetoothInfo *info)
 {
     if (strcmp(interface, "hci0") != 0 || info == NULL) {
         return 0;
+    }
+    fake_read_info_calls++;
+    if (fake_controller == FAKE_CONTROLLER_MISSING && fake_rfkill_unblocked &&
+        fake_registration_after_reads != 0u &&
+        fake_read_info_calls >= fake_registration_after_reads) {
+        fake_controller = FAKE_CONTROLLER_OFF;
     }
     if (fake_controller == FAKE_CONTROLLER_MISSING) {
         (void)snprintf(
@@ -55,6 +62,12 @@ static int fake_read_info(const char *interface, BluetoothInfo *info)
         );
         return 0;
     }
+    (void)snprintf(
+        bluetooth_management_error,
+        sizeof(bluetooth_management_error),
+        "%s",
+        "none"
+    );
     memset(info, 0, sizeof(*info));
     info->index = 0;
     info->powered = fake_controller == FAKE_CONTROLLER_ON;
@@ -99,16 +112,6 @@ static int fake_write_rfkill(const char *domain, int unblocked)
     return 1;
 }
 
-static int fake_bring_up(const char *interface)
-{
-    fake_bring_up_calls++;
-    if (strcmp(interface, "hci0") != 0 || !fake_rfkill_unblocked) {
-        return 0;
-    }
-    fake_controller = FAKE_CONTROLLER_OFF;
-    return 1;
-}
-
 static void fake_wait(unsigned int milliseconds)
 {
     fake_wait_total_ms += milliseconds;
@@ -121,7 +124,8 @@ static void reset_fake(enum fake_controller_state controller, int unblocked)
     fake_rfkill_unblocked = unblocked;
     memset(fake_rfkill_writes, 0, sizeof(fake_rfkill_writes));
     fake_rfkill_write_count = 0u;
-    fake_bring_up_calls = 0u;
+    fake_read_info_calls = 0u;
+    fake_registration_after_reads = 2u;
     fake_wait_total_ms = 0u;
     (void)snprintf(
         bluetooth_management_error,
@@ -138,7 +142,6 @@ int main(void)
         fake_write_management,
         fake_read_rfkill,
         fake_write_rfkill,
-        fake_bring_up,
         fake_wait,
     };
     int sockets[2];
@@ -220,6 +223,7 @@ int main(void)
     }
 
     reset_fake(FAKE_CONTROLLER_ON, 1);
+    fake_registration_after_reads = 0u;
     if (!request_bluetooth_power_with("hci0", 0, &fake_operations) ||
         fake_controller != FAKE_CONTROLLER_MISSING ||
         fake_rfkill_write_count != 0u) {
@@ -231,7 +235,7 @@ int main(void)
         fake_controller != FAKE_CONTROLLER_ON ||
         fake_rfkill_write_count != 2u ||
         fake_rfkill_writes[0] != 0 || fake_rfkill_writes[1] != 1 ||
-        fake_bring_up_calls != 1u || fake_wait_total_ms < 200u) {
+        fake_read_info_calls != 3u || fake_wait_total_ms < 200u) {
         return 9;
     }
 
@@ -239,7 +243,7 @@ int main(void)
     if (!request_bluetooth_power_with("hci0", 1, &fake_operations) ||
         fake_controller != FAKE_CONTROLLER_ON ||
         fake_rfkill_write_count != 1u || fake_rfkill_writes[0] != 1 ||
-        fake_bring_up_calls != 1u) {
+        fake_read_info_calls != 3u) {
         return 10;
     }
 
@@ -254,6 +258,27 @@ int main(void)
     if (request_bluetooth_power_with("hci0", 1, &fake_operations) ||
         fake_rfkill_write_count != 0u) {
         return 12;
+    }
+
+    reset_fake(FAKE_CONTROLLER_MISSING, 1);
+    fake_registration_after_reads = 5u;
+    if (!request_bluetooth_power_with("hci0", 1, &fake_operations) ||
+        fake_controller != FAKE_CONTROLLER_ON ||
+        fake_read_info_calls != 6u ||
+        fake_rfkill_write_count != 2u ||
+        fake_rfkill_writes[0] != 0 || fake_rfkill_writes[1] != 1) {
+        return 13;
+    }
+
+    reset_fake(FAKE_CONTROLLER_MISSING, 1);
+    fake_registration_after_reads = 0u;
+    if (request_bluetooth_power_with("hci0", 1, &fake_operations) ||
+        fake_controller != FAKE_CONTROLLER_MISSING ||
+        fake_read_info_calls != 51u ||
+        fake_rfkill_write_count != 2u ||
+        fake_rfkill_writes[0] != 0 || fake_rfkill_writes[1] != 1 ||
+        fake_wait_total_ms != 5100u) {
+        return 14;
     }
 
     (void)close(sockets[0]);

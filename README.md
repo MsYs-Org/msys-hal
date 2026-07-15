@@ -14,7 +14,7 @@ status and Bluetooth radio status. A board-specific native provider is an
 ordinary language-neutral MSYS package and may outrank or be selected instead
 of one reference domain.
 
-Version 0.2.9 uses the single-process C11 native manager as the normal resident
+Version 0.2.10 uses the single-process C11 native manager as the normal resident
 HAL and retains the Python manager/providers as idle-reaped on-demand
 fallbacks. Its phase-one hardware and compatibility boundaries, strict write
 allowlist, build, aarch64 smoke test, and RSS measurement are documented in
@@ -36,11 +36,12 @@ from Linux Management power commands when the caller intentionally discards
 the response body. The command is still status-checked and bounded; a
 successful kernel power transition no longer becomes a false internal error.
 
-Version 0.2.9 handles controllers such as Qualcomm WCNSS that unregister their
+Version 0.2.10 handles controllers such as Qualcomm WCNSS that unregister their
 Linux Management index after power-off. A later power-on uses one bounded
 rfkill block/unblock edge and at most 20 Management re-probes.
 If this kernel retains a down `hciN` sysfs device without re-registering it,
-the bounded path uses Linux `HCIDEVUP` before the Management retry; no BlueZ
+the bounded path retries Linux `HCIDEVUP` inside the same probe window while
+the exact Management state remains `index-list:0`; no BlueZ
 command, D-Bus service, or target package is introduced.
 rfkill's soft=0 is now reported as `rfkill_unblocked`, never as proof that a
 Bluetooth controller is powered. When the Management index is absent, the
