@@ -59,6 +59,19 @@ def dirty_stats_text(**overrides) -> str:
     )
 
 
+def overlay_text(
+    *, enabled: bool = False, alpha: int = 176, scale: int = 1,
+    items: int = 7, interval_ms: int = 1000,
+) -> str:
+    return (
+        f"CH347_DEBUG_OVERLAY={int(enabled)}\n"
+        f"CH347_DEBUG_OVERLAY_ALPHA={alpha}\n"
+        f"CH347_DEBUG_OVERLAY_SCALE={scale}\n"
+        f"CH347_DEBUG_OVERLAY_ITEMS={items}\n"
+        f"CH347_DEBUG_OVERLAY_INTERVAL_MS={interval_ms}\n"
+    )
+
+
 class FakeGateway:
     def __init__(self, *, present: bool = True, state: str = "ready") -> None:
         self.present = present
@@ -106,6 +119,9 @@ class Ch347ControlTests(unittest.TestCase):
             "FPS=60\nXCAP_MAX_FPS=60\nXCAP_IDLE_FPS=1\n",
             encoding="ascii",
         )
+        (self.config / "debug_overlay.env").write_text(
+            overlay_text(), encoding="ascii"
+        )
         (self.config / "touch_calibration.env").write_text(
             calibration_text(
                 x_min=207,
@@ -135,6 +151,10 @@ class Ch347ControlTests(unittest.TestCase):
             "XCAP_IDLE_FPS=1\n",
             encoding="ascii",
         )
+        (self.run / "debug-overlay.applied.env").write_text(
+            "MSYS_GENERATION=7\n" + overlay_text(),
+            encoding="ascii",
+        )
         self.signals: list[tuple[int, int]] = []
         self.gateway = FakeGateway()
         self.generation = 7
@@ -148,6 +168,11 @@ class Ch347ControlTests(unittest.TestCase):
             )
             (self.run / "display-config.applied.env").write_text(
                 f"MSYS_GENERATION={self.generation}\n{config}",
+                encoding="ascii",
+            )
+            overlay = (self.config / "debug_overlay.env").read_text(encoding="ascii")
+            (self.run / "debug-overlay.applied.env").write_text(
+                f"MSYS_GENERATION={self.generation}\n{overlay}",
                 encoding="ascii",
             )
             (self.run / "live.log").write_text(
@@ -185,6 +210,7 @@ class Ch347ControlTests(unittest.TestCase):
             device["mutable"],
             [
                 "debug_enabled",
+                "debug_overlay",
                 "fps",
                 "idle_fps",
                 "touch_calibration",
@@ -202,6 +228,16 @@ class Ch347ControlTests(unittest.TestCase):
         self.assertFalse(state["values"]["debug"]["enabled"])
         self.assertTrue(state["values"]["debug"]["applied"])
         self.assertEqual(state["values"]["debug"]["provider_generation"], 7)
+        self.assertEqual(
+            state["values"]["debug"]["overlay"],
+            {
+                "enabled": False,
+                "alpha": 176,
+                "scale": 1,
+                "items": ["fps", "dirty", "bytes"],
+                "interval_ms": 1000,
+            },
+        )
         self.assertEqual(state["values"]["idle_fps"], 1)
         self.assertEqual(state["values"]["touch_calibration"]["x_min"], 207)
         self.assertEqual(state["values"]["physical_rotation"], "normal")
@@ -276,6 +312,42 @@ class Ch347ControlTests(unittest.TestCase):
 
         with self.assertRaises(ValidationError):
             self.backend.set_state(DEVICE_ID, {"debug_enabled": 1})
+
+    def test_debug_overlay_is_exposed_only_after_exact_active_generation_receipt(self) -> None:
+        configured = self.backend.get_state(DEVICE_ID)["values"]["debug"]
+        self.assertIn("overlay", configured)
+
+        cases = {
+            "missing": None,
+            "stale-generation": (
+                "MSYS_GENERATION=6\n" + overlay_text()
+            ),
+            "different-alpha": (
+                "MSYS_GENERATION=7\n" + overlay_text(alpha=128)
+            ),
+            "different-items": (
+                "MSYS_GENERATION=7\n" + overlay_text(items=1)
+            ),
+        }
+        for name, receipt in cases.items():
+            with self.subTest(name=name):
+                if receipt is None:
+                    self.backend.applied_overlay_path.unlink(missing_ok=True)
+                else:
+                    self.backend.applied_overlay_path.write_text(
+                        receipt,
+                        encoding="ascii",
+                    )
+                debug = self.backend.get_state(DEVICE_ID)["values"]["debug"]
+                self.assertNotIn("overlay", debug)
+
+        self.backend.applied_overlay_path.write_text(
+            "MSYS_GENERATION=7\n" + overlay_text(),
+            encoding="ascii",
+        )
+        self.gateway.state = "declared"
+        debug = self.backend.get_state(DEVICE_ID)["values"]["debug"]
+        self.assertNotIn("overlay", debug)
 
     def test_latest_dirty_stats_are_exposed_even_when_debug_is_disabled(self) -> None:
         (self.run / "live.log").write_text(
@@ -572,6 +644,29 @@ class Ch347ControlTests(unittest.TestCase):
         self.assertTrue(debug_after["debug"]["enabled"])
         self.assertTrue(debug_after["debug"]["applied"])
         self.assertEqual(debug_after["debug"]["provider_generation"], 8)
+        overlay_after = service.handle("set_debug", {
+            "overlay": {
+                "enabled": True,
+                "alpha": 128,
+                "scale": 1,
+                "items": ["fps", "bbox", "memory"],
+                "interval_ms": 750,
+            },
+        })
+        self.assertEqual(
+            overlay_after["debug"]["overlay"],
+            {
+                "enabled": True,
+                "alpha": 128,
+                "scale": 1,
+                "items": ["fps", "bbox", "memory"],
+                "interval_ms": 750,
+            },
+        )
+        self.assertEqual(
+            (self.config / "debug_overlay.env").read_text(encoding="ascii"),
+            overlay_text(enabled=True, alpha=128, items=25, interval_ms=750),
+        )
         calibration = service.handle(
             "set_touch_calibration",
             {"touch_calibration": {"swap_xy": True}},

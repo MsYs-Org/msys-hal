@@ -96,6 +96,8 @@ get_fps({})
 set_fps({"fps":60,"idle_fps":1})
 get_debug({})
 set_debug({"enabled":true})
+set_debug({"overlay":{"enabled":true,"alpha":176,"scale":1,
+  "items":["fps","dirty","bytes"],"interval_ms":1000}})
 get_touch_calibration({})
 set_touch_calibration({"touch_calibration":{"invert_x":true}})
 restart({})
@@ -107,13 +109,19 @@ preferred Settings integration because another output-control provider can
 replace this one without a CH347-specific dependency.
 
 The FPS document also contains a strict `DEBUG=0|1` field. `DEBUG=1` enables
-the sink's on-panel FPS/dirty overlay; it is not a target-FPS alias. Both debug
-methods return a `debug` object containing `enabled`, configured `fps`,
+low-rate detailed sink logging; it is not a target-FPS alias. The independent
+`debug_overlay.env` document owns the optional on-panel overlay, which defaults
+off and has bounded alpha, 1x/2x font scale, metric rows and update interval.
+Both debug methods return a `debug` object containing `enabled`, configured `fps`,
 `max_fps`, `idle_fps`, `applied`, `requires_restart`, and the exact
 `provider_generation` from the provider-owned runtime receipt. A changed flag
 is committed atomically and a running display provider is replaced through the
 same exact Core stop/start calls. If the output is stopped, the saved result is
 explicitly `applied:false` and `requires_restart:true` until its next start.
+The optional `overlay` object is returned only when the running provider's
+generation-bound overlay receipt exactly matches every configured overlay
+field. Its absence means unsupported or not yet applied; configured-only
+values are never reported as active provider state.
 
 `observed_fps`, `panel_fps`, and `frames` are populated only from a real,
 bounded parse of the current generation sink log (`out_fps`, `bus_fps`, and

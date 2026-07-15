@@ -38,6 +38,31 @@ FPS_DEFAULTS = {
     "max_fps": 60,
     "idle_fps": 0,
 }
+DEBUG_OVERLAY_ITEM_BITS = {
+    "fps": 1,
+    "dirty": 2,
+    "bytes": 4,
+    "bbox": 8,
+    "memory": 16,
+}
+DEBUG_OVERLAY_KEYS = {
+    "CH347_DEBUG_OVERLAY": "enabled",
+    "CH347_DEBUG_OVERLAY_ALPHA": "alpha",
+    "CH347_DEBUG_OVERLAY_SCALE": "scale",
+    "CH347_DEBUG_OVERLAY_ITEMS": "items_mask",
+    "CH347_DEBUG_OVERLAY_INTERVAL_MS": "interval_ms",
+}
+DEBUG_OVERLAY_DEFAULTS: dict[str, Any] = {
+    "enabled": False,
+    "alpha": 176,
+    "scale": 1,
+    "items": ["fps", "dirty", "bytes"],
+    "interval_ms": 1000,
+}
+APPLIED_OVERLAY_KEYS = dict(
+    DEBUG_OVERLAY_KEYS,
+    MSYS_GENERATION="provider_generation",
+)
 APPLIED_KEYS = dict(FPS_KEYS, MSYS_GENERATION="provider_generation")
 DEBUG_SAMPLE_RE = re.compile(
     r"^(?:dirty|rect) frame=([0-9]{1,10}) captured=[0-9]{1,10} "
@@ -195,6 +220,10 @@ class Ch347ControlBackend:
         return self.config_dir / "touch_calibration.env"
 
     @property
+    def debug_overlay_path(self) -> Path:
+        return self.config_dir / "debug_overlay.env"
+
+    @property
     def rotation_path(self) -> Path:
         return self.config_dir / "rotation.env"
 
@@ -205,6 +234,10 @@ class Ch347ControlBackend:
     @property
     def applied_config_path(self) -> Path:
         return self.run_dir / "display-config.applied.env"
+
+    @property
+    def applied_overlay_path(self) -> Path:
+        return self.run_dir / "debug-overlay.applied.env"
 
     @property
     def owner_path(self) -> Path:
@@ -372,6 +405,77 @@ class Ch347ControlBackend:
             }, None
         except (ProviderError, ValidationError) as exc:
             return dict(FPS_DEFAULTS), exc.message if hasattr(exc, "message") else str(exc)
+
+    @staticmethod
+    def _validated_debug_overlay(value: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            raise ValidationError("debug overlay must be an object")
+        expected = {"enabled", "alpha", "scale", "items", "interval_ms"}
+        unknown = sorted(set(value) - expected)
+        missing = sorted(expected - set(value))
+        if unknown or missing:
+            raise ValidationError(
+                "debug overlay fields are invalid",
+                details={"unknown": unknown, "missing": missing},
+            )
+        if not isinstance(value["enabled"], bool):
+            raise ValidationError("debug overlay enabled must be a boolean")
+        alpha = integer(value["alpha"], "debug overlay alpha", minimum=0, maximum=255)
+        scale = integer(value["scale"], "debug overlay scale", minimum=1, maximum=2)
+        interval = integer(
+            value["interval_ms"],
+            "debug overlay interval_ms",
+            minimum=250,
+            maximum=5000,
+        )
+        items = value["items"]
+        if (
+            not isinstance(items, list)
+            or not items
+            or any(not isinstance(item, str) for item in items)
+            or len(items) != len(set(items))
+            or any(item not in DEBUG_OVERLAY_ITEM_BITS for item in items)
+        ):
+            raise ValidationError("debug overlay items are invalid")
+        return {
+            "enabled": value["enabled"],
+            "alpha": alpha,
+            "scale": scale,
+            "items": [item for item in DEBUG_OVERLAY_ITEM_BITS if item in items],
+            "interval_ms": interval,
+        }
+
+    def _load_debug_overlay(self) -> tuple[dict[str, Any] | None, str | None]:
+        try:
+            text = self._read_regular(self.debug_overlay_path)
+            if text is None:
+                return None, None
+            raw = self._assignments(
+                text,
+                DEBUG_OVERLAY_KEYS,
+                filename=self.debug_overlay_path.name,
+            )
+            missing = sorted(set(DEBUG_OVERLAY_KEYS.values()) - set(raw))
+            if missing:
+                raise ProviderError(
+                    "CH347 debug overlay configuration is incomplete",
+                    details={"fields": missing},
+                )
+            if raw["enabled"] not in {0, 1}:
+                raise ProviderError("CH347 debug overlay enabled must be 0 or 1")
+            mask = integer(raw.pop("items_mask"), "debug overlay items", minimum=1, maximum=31)
+            return self._validated_debug_overlay({
+                "enabled": raw["enabled"] == 1,
+                "alpha": raw["alpha"],
+                "scale": raw["scale"],
+                "items": [
+                    item for item, bit in DEBUG_OVERLAY_ITEM_BITS.items()
+                    if mask & bit
+                ],
+                "interval_ms": raw["interval_ms"],
+            }), None
+        except (ProviderError, ValidationError) as exc:
+            return None, exc.message if hasattr(exc, "message") else str(exc)
 
     def _load_calibration(self) -> tuple[dict[str, Any], str | None]:
         try:
@@ -555,6 +659,18 @@ class Ch347ControlBackend:
             f"XCAP_IDLE_FPS={idle_fps}\n",
         )
 
+    def _write_debug_overlay(self, overlay: dict[str, Any]) -> None:
+        selected = self._validated_debug_overlay(overlay)
+        mask = sum(DEBUG_OVERLAY_ITEM_BITS[item] for item in selected["items"])
+        self._atomic_write(
+            self.debug_overlay_path,
+            f"CH347_DEBUG_OVERLAY={int(selected['enabled'])}\n"
+            f"CH347_DEBUG_OVERLAY_ALPHA={selected['alpha']}\n"
+            f"CH347_DEBUG_OVERLAY_SCALE={selected['scale']}\n"
+            f"CH347_DEBUG_OVERLAY_ITEMS={mask}\n"
+            f"CH347_DEBUG_OVERLAY_INTERVAL_MS={selected['interval_ms']}\n",
+        )
+
     def _write_calibration(self, calibration: dict[str, Any]) -> None:
         encoded: dict[str, int] = {
             field: int(value) if field in BOOLEAN_CALIBRATION_FIELDS else value
@@ -669,6 +785,56 @@ class Ch347ControlBackend:
         except (ProviderError, ValidationError) as exc:
             return None, exc.message if hasattr(exc, "message") else str(exc)
 
+    def _load_applied_debug_overlay(
+        self,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        try:
+            text = self._read_regular(self.applied_overlay_path)
+            owner = self._read_regular(self.owner_path)
+            if text is None or owner is None:
+                return None, "provider-overlay-receipt-missing"
+            raw = self._assignments(
+                text,
+                APPLIED_OVERLAY_KEYS,
+                filename=self.applied_overlay_path.name,
+            )
+            missing = sorted(set(APPLIED_OVERLAY_KEYS.values()) - set(raw))
+            if missing:
+                raise ProviderError(
+                    "CH347 applied debug overlay configuration is incomplete",
+                    details={"fields": missing},
+                )
+            if raw["enabled"] not in {0, 1}:
+                raise ProviderError("applied debug overlay enabled must be 0 or 1")
+            generation = integer(
+                raw.pop("provider_generation"),
+                "provider generation",
+                minimum=0,
+                maximum=2**31 - 1,
+            )
+            owner_match = re.fullmatch(
+                r"([0-9]{1,10}):[0-9]{1,10}:[0-9]{1,12}\n?",
+                owner,
+            )
+            if owner_match is None or int(owner_match.group(1), 10) != generation:
+                raise ProviderError(
+                    "CH347 overlay receipt does not belong to the active generation"
+                )
+            mask = integer(raw.pop("items_mask"), "debug overlay items", minimum=1, maximum=31)
+            overlay = self._validated_debug_overlay({
+                "enabled": raw["enabled"] == 1,
+                "alpha": raw["alpha"],
+                "scale": raw["scale"],
+                "items": [
+                    item for item, bit in DEBUG_OVERLAY_ITEM_BITS.items()
+                    if mask & bit
+                ],
+                "interval_ms": raw["interval_ms"],
+            })
+            return {**overlay, "provider_generation": generation}, None
+        except (ProviderError, ValidationError) as exc:
+            return None, exc.message if hasattr(exc, "message") else str(exc)
+
     def _bounded_log_tail(self) -> tuple[str, ...]:
         """Read a bounded, regular-file-only tail of the current sink log."""
 
@@ -748,14 +914,16 @@ class Ch347ControlBackend:
         self,
         configured: dict[str, Any],
         *,
+        overlay: dict[str, Any] | None,
         component_state: str,
         live_pids: list[int],
         config_error: str | None,
     ) -> dict[str, Any]:
         applied_config, applied_error = self._load_applied_display_config()
-        # ``applied`` describes the DEBUG overlay switch. FPS is independently
-        # hot-reloaded into the capture process with SIGUSR1, while DEBUG is a
-        # sink startup option and therefore generation-bound.
+        applied_overlay, _applied_overlay_error = self._load_applied_debug_overlay()
+        # ``applied`` describes the detailed sink-log switch. FPS is
+        # independently hot-reloaded into the capture process with SIGUSR1,
+        # while DEBUG is a sink startup option and therefore generation-bound.
         matches = (
             applied_config is not None
             and applied_config["debug_enabled"] == configured["debug_enabled"]
@@ -789,7 +957,7 @@ class Ch347ControlBackend:
         else:
             status = "active"
             reason = "sink-debug-log"
-        return {
+        result = {
             "enabled": enabled,
             "applied": applied,
             "requires_restart": not applied,
@@ -812,6 +980,29 @@ class Ch347ControlBackend:
             "status": status,
             "reason": reason,
         }
+        overlay_applied = (
+            overlay is not None
+            and applied_overlay is not None
+            and component_state == "ready"
+            and bool(live_pids)
+            and all(
+                applied_overlay[field] == overlay[field]
+                for field in (
+                    "enabled",
+                    "alpha",
+                    "scale",
+                    "items",
+                    "interval_ms",
+                )
+            )
+        )
+        # Settings treats the presence of this optional object as proof that
+        # the active provider supports and has applied the overlay contract.
+        # Never expose configured-only values: the provider-owned receipt must
+        # belong to the active generation and exactly match every field.
+        if overlay_applied:
+            result["overlay"] = overlay
+        return result
 
     def _configuration_provisioned(self) -> bool:
         """Return whether the display package has established its state root.
@@ -841,7 +1032,11 @@ class Ch347ControlBackend:
     def _mutable_fields(snapshot: dict[str, Any]) -> list[str]:
         fields: list[str] = []
         if snapshot.get("configuration_provisioned"):
-            fields.extend(("debug_enabled", "fps", "idle_fps", "touch_calibration"))
+            fields.append("debug_enabled")
+        if snapshot.get("debug_overlay_provisioned"):
+            fields.append("debug_overlay")
+        if snapshot.get("configuration_provisioned"):
+            fields.extend(("fps", "idle_fps", "touch_calibration"))
         if snapshot.get("rotation_provisioned"):
             fields.append("physical_rotation")
         if snapshot.get("component_state") == "ready":
@@ -852,14 +1047,20 @@ class Ch347ControlBackend:
         summary = self._target_summary()
         live_pids = self._pid_rows()
         fps, fps_error = self._load_fps()
+        overlay, overlay_error = self._load_debug_overlay()
         calibration, calibration_error = self._load_calibration()
         rotation, rotation_error, rotation_provisioned = self._load_rotation()
-        errors = [item for item in (fps_error, calibration_error, rotation_error) if item]
+        errors = [
+            item
+            for item in (fps_error, overlay_error, calibration_error, rotation_error)
+            if item
+        ]
         provisioned = self._configuration_provisioned()
         component_state = summary["state"] if summary is not None else "missing"
         running = component_state == "ready" and bool(live_pids)
         debug = self._debug_snapshot(
             fps,
+            overlay=overlay,
             component_state=component_state,
             live_pids=live_pids,
             config_error=fps_error,
@@ -892,6 +1093,7 @@ class Ch347ControlBackend:
             "configuration_errors": errors,
             "debug": debug,
             "debug_enabled": debug["enabled"],
+            "debug_overlay_provisioned": overlay is not None,
             "fps": fps["fps"],
             "max_fps": fps["max_fps"],
             "idle_fps": fps["idle_fps"],
@@ -996,6 +1198,7 @@ class Ch347ControlBackend:
             raise ValidationError("unknown CH347 output device")
         allowed = {
             "debug_enabled",
+            "debug_overlay",
             "fps",
             "idle_fps",
             "touch_calibration",
@@ -1014,6 +1217,7 @@ class Ch347ControlBackend:
                 )
             config_changes = set(changes) & {
                 "debug_enabled",
+                "debug_overlay",
                 "fps",
                 "idle_fps",
                 "touch_calibration",
@@ -1028,6 +1232,7 @@ class Ch347ControlBackend:
                     },
                 )
             current_fps, _fps_error = self._load_fps()
+            current_overlay, _overlay_error = self._load_debug_overlay()
             current_calibration, _calibration_error = self._load_calibration()
             debug_enabled = (
                 changes["debug_enabled"]
@@ -1036,6 +1241,15 @@ class Ch347ControlBackend:
             )
             if not isinstance(debug_enabled, bool):
                 raise ValidationError("debug_enabled must be a boolean")
+            overlay_changed = "debug_overlay" in changes
+            if overlay_changed:
+                if current_overlay is None:
+                    raise UnavailableError(
+                        "CH347 display-output has not provisioned debug overlay settings"
+                    )
+                debug_overlay = self._validated_debug_overlay(changes["debug_overlay"])
+            else:
+                debug_overlay = current_overlay
             fps = (
                 integer(changes["fps"], "fps", minimum=1, maximum=240)
                 if "fps" in changes
@@ -1083,6 +1297,8 @@ class Ch347ControlBackend:
             )
             if debug_changed or "fps" in changes or "idle_fps" in changes:
                 self._write_fps(debug_enabled, fps, idle_fps)
+            if overlay_changed and debug_overlay is not None:
+                self._write_debug_overlay(debug_overlay)
             if "fps" in changes or "idle_fps" in changes:
                 self._reload_fps()
             if calibration_changed:
@@ -1090,7 +1306,7 @@ class Ch347ControlBackend:
             if rotation_changed:
                 self._write_rotation(rotation)
             if restart_requested or (
-                (debug_changed or calibration_changed or rotation_changed)
+                (debug_changed or overlay_changed or calibration_changed or rotation_changed)
                 and summary["state"] == "ready"
             ):
                 self._restart()
@@ -1156,15 +1372,23 @@ class Ch347ControlService:
         if method == "set_debug":
             request = object_payload(
                 payload,
-                allowed=("enabled",),
-                required=("enabled",),
+                allowed=("enabled", "overlay"),
             )
-            enabled = request["enabled"]
-            if not isinstance(enabled, bool):
-                raise ValidationError("enabled must be a boolean")
+            if not request:
+                raise ValidationError("set_debug requires enabled or overlay")
+            changes: dict[str, Any] = {}
+            if "enabled" in request:
+                enabled = request["enabled"]
+                if not isinstance(enabled, bool):
+                    raise ValidationError("enabled must be a boolean")
+                changes["debug_enabled"] = enabled
+            if "overlay" in request:
+                changes["debug_overlay"] = self.backend._validated_debug_overlay(
+                    request["overlay"]
+                )
             state = self.backend.set_state(
                 DEVICE_ID,
-                {"debug_enabled": enabled},
+                changes,
             )["values"]
             return {
                 "schema": CONTROL_INTERFACE,

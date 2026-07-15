@@ -3,7 +3,7 @@
   "package": {
     "id": "org.msys.hal.linux",
     "name": "MSYS Linux HAL",
-    "version": "0.2.11",
+    "version": "0.2.12",
     "kind": "system",
     "summary": "Replaceable hardware abstraction manager and safe Linux providers"
   },
