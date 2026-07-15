@@ -122,6 +122,9 @@ class Ch347ControlTests(unittest.TestCase):
         (self.config / "debug_overlay.env").write_text(
             overlay_text(), encoding="ascii"
         )
+        (self.config / "cursor.env").write_text(
+            "CH347_CURSOR=0\n", encoding="ascii"
+        )
         (self.config / "touch_calibration.env").write_text(
             calibration_text(
                 x_min=207,
@@ -155,6 +158,10 @@ class Ch347ControlTests(unittest.TestCase):
             "MSYS_GENERATION=7\n" + overlay_text(),
             encoding="ascii",
         )
+        (self.run / "cursor.applied.env").write_text(
+            "MSYS_GENERATION=7\nCH347_CURSOR=0\n",
+            encoding="ascii",
+        )
         self.signals: list[tuple[int, int]] = []
         self.gateway = FakeGateway()
         self.generation = 7
@@ -173,6 +180,11 @@ class Ch347ControlTests(unittest.TestCase):
             overlay = (self.config / "debug_overlay.env").read_text(encoding="ascii")
             (self.run / "debug-overlay.applied.env").write_text(
                 f"MSYS_GENERATION={self.generation}\n{overlay}",
+                encoding="ascii",
+            )
+            cursor = (self.config / "cursor.env").read_text(encoding="ascii")
+            (self.run / "cursor.applied.env").write_text(
+                f"MSYS_GENERATION={self.generation}\n{cursor}",
                 encoding="ascii",
             )
             (self.run / "live.log").write_text(
@@ -211,6 +223,7 @@ class Ch347ControlTests(unittest.TestCase):
             [
                 "debug_enabled",
                 "debug_overlay",
+                "touch_cursor_enabled",
                 "fps",
                 "idle_fps",
                 "touch_calibration",
@@ -236,6 +249,16 @@ class Ch347ControlTests(unittest.TestCase):
                 "scale": 1,
                 "items": ["fps", "dirty", "bytes"],
                 "interval_ms": 1000,
+            },
+        )
+        self.assertEqual(
+            state["values"]["debug"]["touch_cursor"],
+            {
+                "enabled": False,
+                "applied": True,
+                "requires_restart": False,
+                "provider_generation": 7,
+                "reason": "applied",
             },
         )
         self.assertEqual(state["values"]["idle_fps"], 1)
@@ -348,6 +371,56 @@ class Ch347ControlTests(unittest.TestCase):
         self.gateway.state = "declared"
         debug = self.backend.get_state(DEVICE_ID)["values"]["debug"]
         self.assertNotIn("overlay", debug)
+
+    def test_touch_cursor_is_persistent_and_generation_verified(self) -> None:
+        state = self.backend.set_state(
+            DEVICE_ID,
+            {"touch_cursor_enabled": True},
+        )
+
+        self.assertEqual(
+            (self.config / "cursor.env").read_text(encoding="ascii"),
+            "CH347_CURSOR=1\n",
+        )
+        self.assertEqual(
+            [call[1] for call in self.gateway.calls if call[1] in {"stop", "start"}],
+            ["stop", "start"],
+        )
+        cursor = state["values"]["debug"]["touch_cursor"]
+        self.assertEqual(
+            cursor,
+            {
+                "enabled": True,
+                "applied": True,
+                "requires_restart": False,
+                "provider_generation": 8,
+                "reason": "applied",
+            },
+        )
+
+        (self.run / "cursor.applied.env").write_text(
+            "MSYS_GENERATION=7\nCH347_CURSOR=1\n",
+            encoding="ascii",
+        )
+        stale = self.backend.get_state(DEVICE_ID)["values"]["debug"]["touch_cursor"]
+        self.assertFalse(stale["applied"])
+        self.assertTrue(stale["requires_restart"])
+        self.assertIsNone(stale["provider_generation"])
+        self.assertIn("active generation", stale["reason"])
+
+        with self.assertRaises(ValidationError):
+            self.backend.set_state(DEVICE_ID, {"touch_cursor_enabled": 1})
+
+    def test_old_driver_without_cursor_contract_never_accepts_fake_write(self) -> None:
+        (self.config / "cursor.env").unlink()
+        (self.run / "cursor.applied.env").unlink()
+
+        state = self.backend.get_state(DEVICE_ID)
+        self.assertNotIn("touch_cursor", state["values"]["debug"])
+        self.assertNotIn("touch_cursor_enabled", state["mutable"])
+        with self.assertRaises(UnavailableError):
+            self.backend.set_state(DEVICE_ID, {"touch_cursor_enabled": True})
+        self.assertFalse((self.config / "cursor.env").exists())
 
     def test_latest_dirty_stats_are_exposed_even_when_debug_is_disabled(self) -> None:
         (self.run / "live.log").write_text(
@@ -667,6 +740,9 @@ class Ch347ControlTests(unittest.TestCase):
             (self.config / "debug_overlay.env").read_text(encoding="ascii"),
             overlay_text(enabled=True, alpha=128, items=25, interval_ms=750),
         )
+        cursor_after = service.handle("set_debug", {"cursor_enabled": True})
+        self.assertTrue(cursor_after["debug"]["touch_cursor"]["enabled"])
+        self.assertTrue(cursor_after["debug"]["touch_cursor"]["applied"])
         calibration = service.handle(
             "set_touch_calibration",
             {"touch_calibration": {"swap_xy": True}},

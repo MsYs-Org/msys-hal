@@ -59,6 +59,8 @@ DEBUG_OVERLAY_DEFAULTS: dict[str, Any] = {
     "items": ["fps", "dirty", "bytes"],
     "interval_ms": 1000,
 }
+CURSOR_KEYS = {"CH347_CURSOR": "enabled"}
+APPLIED_CURSOR_KEYS = dict(CURSOR_KEYS, MSYS_GENERATION="provider_generation")
 APPLIED_OVERLAY_KEYS = dict(
     DEBUG_OVERLAY_KEYS,
     MSYS_GENERATION="provider_generation",
@@ -224,6 +226,10 @@ class Ch347ControlBackend:
         return self.config_dir / "debug_overlay.env"
 
     @property
+    def cursor_path(self) -> Path:
+        return self.config_dir / "cursor.env"
+
+    @property
     def rotation_path(self) -> Path:
         return self.config_dir / "rotation.env"
 
@@ -238,6 +244,10 @@ class Ch347ControlBackend:
     @property
     def applied_overlay_path(self) -> Path:
         return self.run_dir / "debug-overlay.applied.env"
+
+    @property
+    def applied_cursor_path(self) -> Path:
+        return self.run_dir / "cursor.applied.env"
 
     @property
     def owner_path(self) -> Path:
@@ -477,6 +487,22 @@ class Ch347ControlBackend:
         except (ProviderError, ValidationError) as exc:
             return None, exc.message if hasattr(exc, "message") else str(exc)
 
+    def _load_cursor(self) -> tuple[bool | None, str | None]:
+        try:
+            text = self._read_regular(self.cursor_path)
+            if text is None:
+                return None, None
+            raw = self._assignments(
+                text,
+                CURSOR_KEYS,
+                filename=self.cursor_path.name,
+            )
+            if set(raw) != {"enabled"} or raw["enabled"] not in {0, 1}:
+                raise ProviderError("CH347 cursor configuration must be 0 or 1")
+            return raw["enabled"] == 1, None
+        except ProviderError as exc:
+            return None, exc.message if hasattr(exc, "message") else str(exc)
+
     def _load_calibration(self) -> tuple[dict[str, Any], str | None]:
         try:
             text = self._read_regular(self.calibration_path)
@@ -671,6 +697,11 @@ class Ch347ControlBackend:
             f"CH347_DEBUG_OVERLAY_INTERVAL_MS={selected['interval_ms']}\n",
         )
 
+    def _write_cursor(self, enabled: bool) -> None:
+        if not isinstance(enabled, bool):
+            raise ValidationError("touch_cursor_enabled must be a boolean")
+        self._atomic_write(self.cursor_path, f"CH347_CURSOR={int(enabled)}\n")
+
     def _write_calibration(self, calibration: dict[str, Any]) -> None:
         encoded: dict[str, int] = {
             field: int(value) if field in BOOLEAN_CALIBRATION_FIELDS else value
@@ -835,6 +866,72 @@ class Ch347ControlBackend:
         except (ProviderError, ValidationError) as exc:
             return None, exc.message if hasattr(exc, "message") else str(exc)
 
+    def _load_applied_cursor(
+        self,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        try:
+            text = self._read_regular(self.applied_cursor_path)
+            owner = self._read_regular(self.owner_path)
+            if text is None or owner is None:
+                return None, "provider-cursor-receipt-missing"
+            raw = self._assignments(
+                text,
+                APPLIED_CURSOR_KEYS,
+                filename=self.applied_cursor_path.name,
+            )
+            if set(raw) != {"enabled", "provider_generation"}:
+                raise ProviderError("CH347 applied cursor configuration is incomplete")
+            if raw["enabled"] not in {0, 1}:
+                raise ProviderError("applied CH347 cursor must be 0 or 1")
+            generation = integer(
+                raw["provider_generation"],
+                "provider generation",
+                minimum=0,
+                maximum=2**31 - 1,
+            )
+            owner_match = re.fullmatch(
+                r"([0-9]{1,10}):[0-9]{1,10}:[0-9]{1,12}\n?",
+                owner,
+            )
+            if owner_match is None or int(owner_match.group(1), 10) != generation:
+                raise ProviderError(
+                    "CH347 cursor receipt does not belong to the active generation"
+                )
+            return {
+                "enabled": raw["enabled"] == 1,
+                "provider_generation": generation,
+            }, None
+        except (ProviderError, ValidationError) as exc:
+            return None, exc.message if hasattr(exc, "message") else str(exc)
+
+    def _cursor_snapshot(
+        self,
+        configured: bool | None,
+        *,
+        component_state: str,
+        live_pids: list[int],
+        config_error: str | None,
+    ) -> dict[str, Any] | None:
+        if configured is None:
+            return None
+        receipt, receipt_error = self._load_applied_cursor()
+        matches = receipt is not None and receipt["enabled"] == configured
+        applied = (
+            config_error is None
+            and component_state == "ready"
+            and bool(live_pids)
+            and matches
+        )
+        return {
+            "enabled": configured,
+            "applied": applied,
+            "requires_restart": not applied,
+            "provider_generation": (
+                receipt["provider_generation"] if receipt is not None else None
+            ),
+            "reason": "applied" if applied else receipt_error or "configuration-not-applied",
+        }
+
     def _bounded_log_tail(self) -> tuple[str, ...]:
         """Read a bounded, regular-file-only tail of the current sink log."""
 
@@ -915,6 +1012,7 @@ class Ch347ControlBackend:
         configured: dict[str, Any],
         *,
         overlay: dict[str, Any] | None,
+        cursor: bool | None,
         component_state: str,
         live_pids: list[int],
         config_error: str | None,
@@ -1002,6 +1100,14 @@ class Ch347ControlBackend:
         # belong to the active generation and exactly match every field.
         if overlay_applied:
             result["overlay"] = overlay
+        cursor_state = self._cursor_snapshot(
+            cursor,
+            component_state=component_state,
+            live_pids=live_pids,
+            config_error=None,
+        )
+        if cursor_state is not None:
+            result["touch_cursor"] = cursor_state
         return result
 
     def _configuration_provisioned(self) -> bool:
@@ -1035,6 +1141,8 @@ class Ch347ControlBackend:
             fields.append("debug_enabled")
         if snapshot.get("debug_overlay_provisioned"):
             fields.append("debug_overlay")
+        if snapshot.get("cursor_provisioned"):
+            fields.append("touch_cursor_enabled")
         if snapshot.get("configuration_provisioned"):
             fields.extend(("fps", "idle_fps", "touch_calibration"))
         if snapshot.get("rotation_provisioned"):
@@ -1048,11 +1156,18 @@ class Ch347ControlBackend:
         live_pids = self._pid_rows()
         fps, fps_error = self._load_fps()
         overlay, overlay_error = self._load_debug_overlay()
+        cursor, cursor_error = self._load_cursor()
         calibration, calibration_error = self._load_calibration()
         rotation, rotation_error, rotation_provisioned = self._load_rotation()
         errors = [
             item
-            for item in (fps_error, overlay_error, calibration_error, rotation_error)
+            for item in (
+                fps_error,
+                overlay_error,
+                cursor_error,
+                calibration_error,
+                rotation_error,
+            )
             if item
         ]
         provisioned = self._configuration_provisioned()
@@ -1061,6 +1176,7 @@ class Ch347ControlBackend:
         debug = self._debug_snapshot(
             fps,
             overlay=overlay,
+            cursor=cursor,
             component_state=component_state,
             live_pids=live_pids,
             config_error=fps_error,
@@ -1094,6 +1210,7 @@ class Ch347ControlBackend:
             "debug": debug,
             "debug_enabled": debug["enabled"],
             "debug_overlay_provisioned": overlay is not None,
+            "cursor_provisioned": cursor is not None,
             "fps": fps["fps"],
             "max_fps": fps["max_fps"],
             "idle_fps": fps["idle_fps"],
@@ -1134,6 +1251,7 @@ class Ch347ControlBackend:
                     "component_state": snapshot["component_state"],
                     "fps_hot_reload": True,
                     "debug_overlay_restart": True,
+                    "touch_cursor_restart": True,
                     "touch_calibration_restart": True,
                     "physical_rotation_control": snapshot.get(
                         "physical_rotation_control", "unavailable"
@@ -1199,6 +1317,7 @@ class Ch347ControlBackend:
         allowed = {
             "debug_enabled",
             "debug_overlay",
+            "touch_cursor_enabled",
             "fps",
             "idle_fps",
             "touch_calibration",
@@ -1218,6 +1337,7 @@ class Ch347ControlBackend:
             config_changes = set(changes) & {
                 "debug_enabled",
                 "debug_overlay",
+                "touch_cursor_enabled",
                 "fps",
                 "idle_fps",
                 "touch_calibration",
@@ -1233,6 +1353,7 @@ class Ch347ControlBackend:
                 )
             current_fps, _fps_error = self._load_fps()
             current_overlay, _overlay_error = self._load_debug_overlay()
+            current_cursor, _cursor_error = self._load_cursor()
             current_calibration, _calibration_error = self._load_calibration()
             debug_enabled = (
                 changes["debug_enabled"]
@@ -1250,6 +1371,17 @@ class Ch347ControlBackend:
                 debug_overlay = self._validated_debug_overlay(changes["debug_overlay"])
             else:
                 debug_overlay = current_overlay
+            cursor_changed = "touch_cursor_enabled" in changes
+            if cursor_changed:
+                if current_cursor is None:
+                    raise UnavailableError(
+                        "CH347 display-output has not provisioned cursor settings"
+                    )
+                cursor_enabled = changes["touch_cursor_enabled"]
+                if not isinstance(cursor_enabled, bool):
+                    raise ValidationError("touch_cursor_enabled must be a boolean")
+            else:
+                cursor_enabled = current_cursor
             fps = (
                 integer(changes["fps"], "fps", minimum=1, maximum=240)
                 if "fps" in changes
@@ -1299,6 +1431,8 @@ class Ch347ControlBackend:
                 self._write_fps(debug_enabled, fps, idle_fps)
             if overlay_changed and debug_overlay is not None:
                 self._write_debug_overlay(debug_overlay)
+            if cursor_changed and cursor_enabled is not None:
+                self._write_cursor(cursor_enabled)
             if "fps" in changes or "idle_fps" in changes:
                 self._reload_fps()
             if calibration_changed:
@@ -1306,7 +1440,13 @@ class Ch347ControlBackend:
             if rotation_changed:
                 self._write_rotation(rotation)
             if restart_requested or (
-                (debug_changed or overlay_changed or calibration_changed or rotation_changed)
+                (
+                    debug_changed
+                    or overlay_changed
+                    or cursor_changed
+                    or calibration_changed
+                    or rotation_changed
+                )
                 and summary["state"] == "ready"
             ):
                 self._restart()
@@ -1326,6 +1466,8 @@ class Ch347ControlService:
             capabilities=[
                 "display-output.debug-overlay",
                 "display-output.debug-overlay.write",
+                "display-output.touch-cursor",
+                "display-output.touch-cursor.write",
                 "display-output.fps",
                 "display-output.fps.write",
                 "display-output.restart",
@@ -1372,10 +1514,12 @@ class Ch347ControlService:
         if method == "set_debug":
             request = object_payload(
                 payload,
-                allowed=("enabled", "overlay"),
+                allowed=("enabled", "overlay", "cursor_enabled"),
             )
             if not request:
-                raise ValidationError("set_debug requires enabled or overlay")
+                raise ValidationError(
+                    "set_debug requires enabled, overlay or cursor_enabled"
+                )
             changes: dict[str, Any] = {}
             if "enabled" in request:
                 enabled = request["enabled"]
@@ -1386,6 +1530,11 @@ class Ch347ControlService:
                 changes["debug_overlay"] = self.backend._validated_debug_overlay(
                     request["overlay"]
                 )
+            if "cursor_enabled" in request:
+                cursor_enabled = request["cursor_enabled"]
+                if not isinstance(cursor_enabled, bool):
+                    raise ValidationError("cursor_enabled must be a boolean")
+                changes["touch_cursor_enabled"] = cursor_enabled
             state = self.backend.set_state(
                 DEVICE_ID,
                 changes,

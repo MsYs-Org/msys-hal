@@ -261,7 +261,7 @@ class NativeHalProtocolTests(unittest.TestCase):
         described = self._call("describe", {})
         self.assertEqual(described["type"], "return")
         self.assertEqual(described["payload"]["schema"], "org.msys.hal.native-manager.v1")
-        self.assertEqual(described["payload"]["provider"]["version"], "0.2.12")
+        self.assertEqual(described["payload"]["provider"]["version"], "0.2.13")
 
         first = self._call("inventory", {})["payload"]
         second = self._call("inventory", {})["payload"]
@@ -424,7 +424,7 @@ class NativeHalProtocolTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         report = json.loads(completed.stdout)
-        self.assertEqual(report["version"], "0.2.12")
+        self.assertEqual(report["version"], "0.2.13")
         self.assertTrue(report["ok"])
         self.assertTrue(report["wifi_control"])
         self.assertGreaterEqual(report["devices"], 8)

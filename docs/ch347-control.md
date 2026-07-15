@@ -123,6 +123,14 @@ generation-bound overlay receipt exactly matches every configured overlay
 field. Its absence means unsupported or not yet applied; configured-only
 values are never reported as active provider state.
 
+Packages that provision `cursor.env` also expose `debug.touch_cursor` with a
+configured boolean, `applied`, `requires_restart`, and the exact provider
+generation. `set_debug({"cursor_enabled":true})` atomically persists
+`CH347_CURSOR=1`, restarts only the running display provider, and reports
+success only after the new generation's cursor receipt matches. Older display
+packages omit this optional capability instead of accepting an ineffective
+write. The safe default is false.
+
 `observed_fps`, `panel_fps`, and `frames` are populated only from a real,
 bounded parse of the current generation sink log (`out_fps`, `bus_fps`, and
 the cumulative frame counter). Missing samples remain `null`; configured FPS

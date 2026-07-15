@@ -14,6 +14,11 @@ status and Bluetooth radio status. A board-specific native provider is an
 ordinary language-neutral MSYS package and may outrank or be selected instead
 of one reference domain.
 
+Version 0.2.13 extends the optional CH347 control contract with a persistent
+touch-cursor switch. The value is reported as applied only when the active
+display generation publishes a matching receipt; older display packages omit
+the capability and cannot accept an ineffective write.
+
 Version 0.2.10 uses the single-process C11 native manager as the normal resident
 HAL and retains the Python manager/providers as idle-reaped on-demand
 fallbacks. Its phase-one hardware and compatibility boundaries, strict write
