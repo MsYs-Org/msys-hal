@@ -7,6 +7,7 @@ import signal
 import stat
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
@@ -66,6 +67,10 @@ APPLIED_OVERLAY_KEYS = dict(
     MSYS_GENERATION="provider_generation",
 )
 APPLIED_KEYS = dict(FPS_KEYS, MSYS_GENERATION="provider_generation")
+APPLIED_ROTATION_RE = re.compile(
+    r"^MSYS_GENERATION=([0-9]{1,10})\n"
+    r"CH347_DISPLAY_ROTATION=(normal|right|left|inverted)\n?$"
+)
 DEBUG_SAMPLE_RE = re.compile(
     r"^(?:dirty|rect) frame=([0-9]{1,10}) captured=[0-9]{1,10} "
     r"drop=[0-9]{1,10} sent_rects=[0-9]{1,3} "
@@ -248,6 +253,10 @@ class Ch347ControlBackend:
     @property
     def applied_cursor_path(self) -> Path:
         return self.run_dir / "cursor.applied.env"
+
+    @property
+    def applied_rotation_path(self) -> Path:
+        return self.run_dir / "rotation.applied.env"
 
     @property
     def owner_path(self) -> Path:
@@ -753,6 +762,44 @@ class Ch347ControlBackend:
             delivered = True
         return delivered
 
+    def _active_provider(self) -> tuple[int, int]:
+        try:
+            owner = self._read_regular(self.owner_path)
+        except ProviderError as exc:
+            raise UnavailableError(
+                "CH347 display-output owner is unavailable",
+                details={"component": self.target_component},
+            ) from exc
+        if owner is None:
+            raise UnavailableError(
+                "CH347 display-output owner is unavailable",
+                details={"component": self.target_component},
+            )
+        matched = re.fullmatch(
+            r"([0-9]{1,10}):([0-9]{1,10}):[0-9]{1,12}\n?",
+            owner,
+        )
+        if matched is None:
+            raise UnavailableError("CH347 display-output owner token is invalid")
+        generation = integer(
+            int(matched.group(1), 10),
+            "provider generation",
+            minimum=0,
+            maximum=2**31 - 1,
+        )
+        pid = integer(
+            int(matched.group(2), 10),
+            "provider pid",
+            minimum=1,
+            maximum=2**31 - 1,
+        )
+        if not self.pid_alive(pid):
+            raise UnavailableError(
+                "CH347 display-output provider is not running",
+                details={"pid": pid, "generation": generation},
+            )
+        return generation, pid
+
     def _load_applied_display_config(
         self,
     ) -> tuple[dict[str, Any] | None, str | None]:
@@ -903,6 +950,97 @@ class Ch347ControlBackend:
             }, None
         except (ProviderError, ValidationError) as exc:
             return None, exc.message if hasattr(exc, "message") else str(exc)
+
+    def _load_applied_rotation(
+        self,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        try:
+            text = self._read_regular(self.applied_rotation_path)
+            generation, _provider_pid = self._active_provider()
+            if text is None:
+                return None, "provider-rotation-receipt-missing"
+            matched = APPLIED_ROTATION_RE.fullmatch(text)
+            if matched is None:
+                raise ProviderError("CH347 applied rotation configuration is invalid")
+            receipt_generation = integer(
+                int(matched.group(1), 10),
+                "provider generation",
+                minimum=0,
+                maximum=2**31 - 1,
+            )
+            if receipt_generation != generation:
+                raise ProviderError(
+                    "CH347 rotation receipt does not belong to the active generation"
+                )
+            return {
+                "rotation": matched.group(2),
+                "provider_generation": receipt_generation,
+            }, None
+        except (ProviderError, ValidationError, UnavailableError) as exc:
+            return None, exc.message if hasattr(exc, "message") else str(exc)
+
+    def _runtime_receipts_match(self) -> bool:
+        configured_fps, fps_error = self._load_fps()
+        configured_overlay, overlay_error = self._load_debug_overlay()
+        configured_cursor, cursor_error = self._load_cursor()
+        configured_rotation, rotation_error, rotation_provisioned = self._load_rotation()
+        if (
+            fps_error
+            or overlay_error
+            or cursor_error
+            or rotation_error
+            or configured_overlay is None
+            or configured_cursor is None
+            or not rotation_provisioned
+        ):
+            return False
+        applied_fps, _ = self._load_applied_display_config()
+        applied_overlay, _ = self._load_applied_debug_overlay()
+        applied_cursor, _ = self._load_applied_cursor()
+        applied_rotation, _ = self._load_applied_rotation()
+        return bool(
+            applied_fps is not None
+            and applied_overlay is not None
+            and applied_cursor is not None
+            and applied_rotation is not None
+            and all(
+                applied_fps[field] == configured_fps[field]
+                for field in ("debug_enabled", "fps", "max_fps", "idle_fps")
+            )
+            and all(
+                applied_overlay[field] == configured_overlay[field]
+                for field in ("enabled", "alpha", "scale", "items", "interval_ms")
+            )
+            and applied_cursor["enabled"] == configured_cursor
+            and applied_rotation["rotation"] == configured_rotation
+        )
+
+    def _reload_runtime(self, *, timeout: float = 5.0) -> None:
+        generation, provider_pid = self._active_provider()
+        try:
+            self.signal_process(provider_pid, signal.SIGUSR1)
+        except (OSError, ValueError) as exc:
+            raise UnavailableError(
+                "CH347 configuration was saved but provider reload failed",
+                details={
+                    "component": self.target_component,
+                    "generation": generation,
+                    "pid": provider_pid,
+                },
+            ) from exc
+        deadline = time.monotonic() + max(0.1, timeout)
+        while time.monotonic() < deadline:
+            if self._runtime_receipts_match():
+                return
+            time.sleep(0.05)
+        raise UnavailableError(
+            "CH347 configuration was saved but runtime apply timed out",
+            details={
+                "component": self.target_component,
+                "generation": generation,
+                "pid": provider_pid,
+            },
+        )
 
     def _cursor_snapshot(
         self,
@@ -1250,9 +1388,11 @@ class Ch347ControlBackend:
                     "driver": self.target_component,
                     "component_state": snapshot["component_state"],
                     "fps_hot_reload": True,
-                    "debug_overlay_restart": True,
-                    "touch_cursor_restart": True,
+                    "debug_log_hot_reload": True,
+                    "debug_overlay_hot_reload": True,
+                    "touch_cursor_hot_reload": True,
                     "touch_calibration_restart": True,
+                    "physical_rotation_hot_reload": True,
                     "physical_rotation_control": snapshot.get(
                         "physical_rotation_control", "unavailable"
                     ),
@@ -1433,23 +1573,24 @@ class Ch347ControlBackend:
                 self._write_debug_overlay(debug_overlay)
             if cursor_changed and cursor_enabled is not None:
                 self._write_cursor(cursor_enabled)
-            if "fps" in changes or "idle_fps" in changes:
-                self._reload_fps()
             if calibration_changed:
                 self._write_calibration(calibration)
             if rotation_changed:
                 self._write_rotation(rotation)
+            hot_changed = bool(
+                debug_changed
+                or overlay_changed
+                or cursor_changed
+                or "fps" in changes
+                or "idle_fps" in changes
+                or rotation_changed
+            )
             if restart_requested or (
-                (
-                    debug_changed
-                    or overlay_changed
-                    or cursor_changed
-                    or calibration_changed
-                    or rotation_changed
-                )
-                and summary["state"] == "ready"
+                calibration_changed and summary["state"] == "ready"
             ):
                 self._restart()
+            elif hot_changed and summary["state"] == "ready":
+                self._reload_runtime()
             return self.get_state(identifier)
 
 

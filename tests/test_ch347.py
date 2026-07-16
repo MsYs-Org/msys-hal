@@ -116,7 +116,7 @@ class Ch347ControlTests(unittest.TestCase):
         self.config.mkdir(parents=True)
         self.run.mkdir(parents=True)
         (self.config / "fps.env").write_text(
-            "FPS=60\nXCAP_MAX_FPS=60\nXCAP_IDLE_FPS=1\n",
+            "DEBUG=0\nFPS=60\nXCAP_MAX_FPS=60\nXCAP_IDLE_FPS=1\n",
             encoding="ascii",
         )
         (self.config / "debug_overlay.env").write_text(
@@ -162,17 +162,16 @@ class Ch347ControlTests(unittest.TestCase):
             "MSYS_GENERATION=7\nCH347_CURSOR=0\n",
             encoding="ascii",
         )
+        (self.run / "rotation.applied.env").write_text(
+            "MSYS_GENERATION=7\nCH347_DISPLAY_ROTATION=normal\n",
+            encoding="ascii",
+        )
         self.signals: list[tuple[int, int]] = []
         self.gateway = FakeGateway()
         self.generation = 7
 
-        def apply_runtime_config() -> None:
-            self.generation += 1
+        def write_runtime_receipts() -> None:
             config = (self.config / "fps.env").read_text(encoding="ascii")
-            (self.run / "msys.provider.owner").write_text(
-                f"{self.generation}:900:1700000000\n",
-                encoding="ascii",
-            )
             (self.run / "display-config.applied.env").write_text(
                 f"MSYS_GENERATION={self.generation}\n{config}",
                 encoding="ascii",
@@ -187,6 +186,11 @@ class Ch347ControlTests(unittest.TestCase):
                 f"MSYS_GENERATION={self.generation}\n{cursor}",
                 encoding="ascii",
             )
+            rotation = (self.config / "rotation.env").read_text(encoding="ascii")
+            (self.run / "rotation.applied.env").write_text(
+                f"MSYS_GENERATION={self.generation}\n{rotation}",
+                encoding="ascii",
+            )
             (self.run / "live.log").write_text(
                 (
                     "dirty frame=20 captured=20 drop=0 sent_rects=1 "
@@ -197,19 +201,32 @@ class Ch347ControlTests(unittest.TestCase):
                 encoding="ascii",
             )
 
+        def apply_runtime_config() -> None:
+            self.generation += 1
+            (self.run / "msys.provider.owner").write_text(
+                f"{self.generation}:900:1700000000\n",
+                encoding="ascii",
+            )
+            write_runtime_receipts()
+
+        def signal_process(pid: int, sig: int) -> None:
+            self.signals.append((pid, sig))
+            if pid == 900 and sig == signal.SIGUSR1:
+                write_runtime_receipts()
+
         self.gateway.on_start = apply_runtime_config
         self.backend = Ch347ControlBackend(
             self.gateway,
             config_dir=self.config,
             run_dir=self.run,
             proc_root=self.root / "proc",
-            pid_alive=lambda pid: pid in {101, 102},
+            pid_alive=lambda pid: pid in {101, 102, 900},
             process_executable=lambda _root, pid: (
                 "/immutable/bin/xdamage_shm_capture"
                 if pid == 101
                 else "/immutable/bin/ch347_dirty_usb_sink"
             ),
-            signal_process=lambda pid, sig: self.signals.append((pid, sig)),
+            signal_process=signal_process,
         )
 
     def test_inventory_and_state_report_typed_live_control(self) -> None:
@@ -267,7 +284,7 @@ class Ch347ControlTests(unittest.TestCase):
         self.assertEqual(state["values"]["physical_rotation_control"], "writable")
         self.assertFalse(state["values"]["restart"])
 
-    def test_fps_write_is_canonical_atomic_and_hot_reloads_only_capture(self) -> None:
+    def test_fps_write_is_canonical_atomic_and_hot_reloads_provider(self) -> None:
         state = self.backend.set_state(
             DEVICE_ID,
             {"fps": 90, "idle_fps": 2},
@@ -279,7 +296,7 @@ class Ch347ControlTests(unittest.TestCase):
             (self.config / "fps.env").read_text(encoding="ascii"),
             "DEBUG=0\nFPS=90\nXCAP_MAX_FPS=90\nXCAP_IDLE_FPS=2\n",
         )
-        self.assertEqual(self.signals, [(101, signal.SIGUSR1)])
+        self.assertEqual(self.signals, [(900, signal.SIGUSR1)])
         self.assertEqual(
             [path.name for path in self.config.iterdir() if path.name.startswith(".fps.env.")],
             [],
@@ -309,13 +326,14 @@ class Ch347ControlTests(unittest.TestCase):
         )
         self.assertEqual(
             [call[1] for call in self.gateway.calls if call[1] in {"stop", "start"}],
-            ["stop", "start"],
+            [],
         )
+        self.assertEqual(self.signals, [(900, signal.SIGUSR1)])
         debug = state["values"]["debug"]
         self.assertTrue(debug["enabled"])
         self.assertTrue(debug["applied"])
         self.assertFalse(debug["requires_restart"])
-        self.assertEqual(debug["provider_generation"], 8)
+        self.assertEqual(debug["provider_generation"], 7)
         self.assertEqual(debug["status"], "active")
         self.assertEqual(debug["reason"], "sink-debug-log")
         self.assertEqual(debug["observed_fps"], 12.5)
@@ -384,8 +402,9 @@ class Ch347ControlTests(unittest.TestCase):
         )
         self.assertEqual(
             [call[1] for call in self.gateway.calls if call[1] in {"stop", "start"}],
-            ["stop", "start"],
+            [],
         )
+        self.assertEqual(self.signals, [(900, signal.SIGUSR1)])
         cursor = state["values"]["debug"]["touch_cursor"]
         self.assertEqual(
             cursor,
@@ -393,13 +412,13 @@ class Ch347ControlTests(unittest.TestCase):
                 "enabled": True,
                 "applied": True,
                 "requires_restart": False,
-                "provider_generation": 8,
+                "provider_generation": 7,
                 "reason": "applied",
             },
         )
 
         (self.run / "cursor.applied.env").write_text(
-            "MSYS_GENERATION=7\nCH347_CURSOR=1\n",
+            "MSYS_GENERATION=6\nCH347_CURSOR=1\n",
             encoding="ascii",
         )
         stale = self.backend.get_state(DEVICE_ID)["values"]["debug"]["touch_cursor"]
@@ -561,7 +580,7 @@ class Ch347ControlTests(unittest.TestCase):
         start = next(call for call in self.gateway.calls if call[1] == "start")
         self.assertEqual(start[3], 30.0)
 
-    def test_physical_rotation_has_independent_atomic_file_and_restarts_output(self) -> None:
+    def test_physical_rotation_has_independent_atomic_file_and_hot_reloads(self) -> None:
         calibration_before = (self.config / "touch_calibration.env").read_bytes()
         state = self.backend.set_state(
             DEVICE_ID,
@@ -579,8 +598,9 @@ class Ch347ControlTests(unittest.TestCase):
         )
         self.assertEqual(
             [call[1] for call in self.gateway.calls if call[1] in {"stop", "start"}],
-            ["stop", "start"],
+            [],
         )
+        self.assertEqual(self.signals, [(900, signal.SIGUSR1)])
         for invalid in ("clockwise", "RIGHT", "", 1, True):
             with self.subTest(invalid=invalid), self.assertRaises(ValidationError):
                 self.backend.set_state(
@@ -716,7 +736,7 @@ class Ch347ControlTests(unittest.TestCase):
         debug_after = service.handle("set_debug", {"enabled": True})
         self.assertTrue(debug_after["debug"]["enabled"])
         self.assertTrue(debug_after["debug"]["applied"])
-        self.assertEqual(debug_after["debug"]["provider_generation"], 8)
+        self.assertEqual(debug_after["debug"]["provider_generation"], 7)
         overlay_after = service.handle("set_debug", {
             "overlay": {
                 "enabled": True,

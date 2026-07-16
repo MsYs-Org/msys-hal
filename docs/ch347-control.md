@@ -44,15 +44,16 @@ State values are:
 - `restart:false`, an action field that generic JSON editors can change to
   `true`.
 
-`fps`, `idle_fps`, `touch_calibration`, and `restart` are the only mutable
-fields. FPS changes are persisted and sent to a live
-`xdamage_shm_capture` with `SIGUSR1` only after the PID file, liveness and
-executable basename all match. This updates the capture cap without tearing
-down X11. A calibration write automatically restarts a running output so the
-touch sink and display-session publisher receive the same values. If the
-output is stopped, the values are saved for its next normal start. Explicit
-restart is accepted only as the boolean `true` and only while the component is
-ready.
+FPS, idle FPS, sink logging, debug overlay, touch cursor, physical rotation,
+touch calibration and restart are mutable when their provider-owned documents
+are provisioned. All fields except calibration use the active owner token:
+HAL signals its provider PID with `SIGUSR1` and waits for same-generation
+receipts. The provider updates the existing daemon, capture and sink in place;
+rotation uses RandR on the existing Xorg root and updates the matching input
+transform. Calibration retains the explicit provider restart because it
+changes the complete touch calibration contract. If the output is stopped,
+values are saved for its next normal start. Explicit restart is accepted only
+as boolean `true` while the component is ready.
 
 The controller never creates an empty package-state tree for the source-tree
 fallback that happens to share the same component id. At least one regular
@@ -115,8 +116,8 @@ off and has bounded alpha, 1x/2x font scale, metric rows and update interval.
 Both debug methods return a `debug` object containing `enabled`, configured `fps`,
 `max_fps`, `idle_fps`, `applied`, `requires_restart`, and the exact
 `provider_generation` from the provider-owned runtime receipt. A changed flag
-is committed atomically and a running display provider is replaced through the
-same exact Core stop/start calls. If the output is stopped, the saved result is
+is committed atomically and signalled to the active provider without replacing
+Xorg, Shell or application processes. If the output is stopped, the saved result is
 explicitly `applied:false` and `requires_restart:true` until its next start.
 The optional `overlay` object is returned only when the running provider's
 generation-bound overlay receipt exactly matches every configured overlay
@@ -126,8 +127,8 @@ values are never reported as active provider state.
 Packages that provision `cursor.env` also expose `debug.touch_cursor` with a
 configured boolean, `applied`, `requires_restart`, and the exact provider
 generation. `set_debug({"cursor_enabled":true})` atomically persists
-`CH347_CURSOR=1`, restarts only the running display provider, and reports
-success only after the new generation's cursor receipt matches. Older display
+`CH347_CURSOR=1`, signals the running provider, and reports success only after
+the same generation's cursor receipt matches. Older display
 packages omit this optional capability instead of accepting an ineffective
 write. The safe default is false.
 
