@@ -31,7 +31,7 @@
 #define O_NOFOLLOW 0
 #endif
 
-#define HAL_VERSION "0.2.15"
+#define HAL_VERSION "0.2.16"
 #define MANAGER_SCHEMA "org.msys.hal.manager.v1"
 #define NATIVE_SCHEMA "org.msys.hal.native-manager.v1"
 #define COMPONENT_ID "org.msys.hal.linux:native-manager"

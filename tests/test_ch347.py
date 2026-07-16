@@ -61,7 +61,7 @@ def dirty_stats_text(**overrides) -> str:
 
 def overlay_text(
     *, enabled: bool = False, alpha: int = 176, scale: int = 1,
-    items: int = 7, interval_ms: int = 1000,
+    items: int = 39, interval_ms: int = 1000,
 ) -> str:
     return (
         f"CH347_DEBUG_OVERLAY={int(enabled)}\n"
@@ -264,7 +264,7 @@ class Ch347ControlTests(unittest.TestCase):
                 "enabled": False,
                 "alpha": 176,
                 "scale": 1,
-                "items": ["fps", "dirty", "bytes"],
+                "items": ["fps", "dirty", "bytes", "cpu"],
                 "interval_ms": 1000,
             },
         )
@@ -389,6 +389,73 @@ class Ch347ControlTests(unittest.TestCase):
         self.gateway.state = "declared"
         debug = self.backend.get_state(DEVICE_ID)["values"]["debug"]
         self.assertNotIn("overlay", debug)
+
+    def test_debug_overlay_cpu_item_persists_and_requires_exact_runtime_receipt(self) -> None:
+        state = self.backend.set_state(
+            DEVICE_ID,
+            {
+                "debug_overlay": {
+                    "enabled": True,
+                    "alpha": 160,
+                    "scale": 2,
+                    "items": ["fps", "dirty", "bytes", "cpu"],
+                    "interval_ms": 500,
+                },
+            },
+        )
+
+        self.assertEqual(
+            (self.config / "debug_overlay.env").read_text(encoding="ascii"),
+            overlay_text(enabled=True, alpha=160, scale=2, items=39, interval_ms=500),
+        )
+        self.assertEqual(self.signals, [(900, signal.SIGUSR1)])
+        self.assertEqual(
+            state["values"]["debug"]["overlay"]["items"],
+            ["fps", "dirty", "bytes", "cpu"],
+        )
+
+        self.backend.applied_overlay_path.write_text(
+            "MSYS_GENERATION=7\n"
+            + overlay_text(enabled=True, alpha=160, scale=2, items=7, interval_ms=500),
+            encoding="ascii",
+        )
+        self.assertNotIn(
+            "overlay",
+            self.backend.get_state(DEVICE_ID)["values"]["debug"],
+        )
+
+    def test_debug_overlay_accepts_all_six_bits_and_rejects_unknown_values(self) -> None:
+        (self.config / "debug_overlay.env").write_text(
+            overlay_text(items=63),
+            encoding="ascii",
+        )
+        (self.run / "debug-overlay.applied.env").write_text(
+            "MSYS_GENERATION=7\n" + overlay_text(items=63),
+            encoding="ascii",
+        )
+        overlay = self.backend.get_state(DEVICE_ID)["values"]["debug"]["overlay"]
+        self.assertEqual(
+            overlay["items"],
+            ["fps", "dirty", "bytes", "bbox", "memory", "cpu"],
+        )
+
+        persisted = (self.config / "debug_overlay.env").read_bytes()
+        for invalid_item in ("processor", 32):
+            candidate = {**overlay, "items": ["fps", invalid_item]}
+            with self.subTest(item=invalid_item), self.assertRaises(ValidationError):
+                self.backend.set_state(DEVICE_ID, {"debug_overlay": candidate})
+            self.assertEqual(
+                (self.config / "debug_overlay.env").read_bytes(),
+                persisted,
+            )
+
+        (self.config / "debug_overlay.env").write_text(
+            overlay_text(items=64),
+            encoding="ascii",
+        )
+        values = self.backend.get_state(DEVICE_ID)["values"]
+        self.assertFalse(values["configuration_valid"])
+        self.assertNotIn("overlay", values["debug"])
 
     def test_touch_cursor_is_persistent_and_generation_verified(self) -> None:
         state = self.backend.set_state(

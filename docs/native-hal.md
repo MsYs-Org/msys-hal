@@ -1,4 +1,4 @@
-# Native HAL host 0.2.15
+# Native HAL host 0.2.16
 
 files/bin/msys-hal-native is the first dependency-free native replacement for
 the always-resident Python HAL graph. It is one C11 process linked directly

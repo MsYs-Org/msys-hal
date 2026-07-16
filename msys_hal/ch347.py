@@ -45,6 +45,7 @@ DEBUG_OVERLAY_ITEM_BITS = {
     "bytes": 4,
     "bbox": 8,
     "memory": 16,
+    "cpu": 32,
 }
 DEBUG_OVERLAY_KEYS = {
     "CH347_DEBUG_OVERLAY": "enabled",
@@ -57,7 +58,7 @@ DEBUG_OVERLAY_DEFAULTS: dict[str, Any] = {
     "enabled": False,
     "alpha": 176,
     "scale": 1,
-    "items": ["fps", "dirty", "bytes"],
+    "items": ["fps", "dirty", "bytes", "cpu"],
     "interval_ms": 1000,
 }
 CURSOR_KEYS = {"CH347_CURSOR": "enabled"}
@@ -482,7 +483,7 @@ class Ch347ControlBackend:
                 )
             if raw["enabled"] not in {0, 1}:
                 raise ProviderError("CH347 debug overlay enabled must be 0 or 1")
-            mask = integer(raw.pop("items_mask"), "debug overlay items", minimum=1, maximum=31)
+            mask = integer(raw.pop("items_mask"), "debug overlay items", minimum=1, maximum=63)
             return self._validated_debug_overlay({
                 "enabled": raw["enabled"] == 1,
                 "alpha": raw["alpha"],
@@ -898,7 +899,7 @@ class Ch347ControlBackend:
                 raise ProviderError(
                     "CH347 overlay receipt does not belong to the active generation"
                 )
-            mask = integer(raw.pop("items_mask"), "debug overlay items", minimum=1, maximum=31)
+            mask = integer(raw.pop("items_mask"), "debug overlay items", minimum=1, maximum=63)
             overlay = self._validated_debug_overlay({
                 "enabled": raw["enabled"] == 1,
                 "alpha": raw["alpha"],

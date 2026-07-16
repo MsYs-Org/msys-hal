@@ -19,11 +19,12 @@ touch-cursor switch. The value is reported as applied only when the active
 display generation publishes a matching receipt; older display packages omit
 the capability and cannot accept an ineffective write.
 
-Version 0.2.15 applies CH347 FPS, sink logging, debug overlay, cursor and
+Version 0.2.16 applies CH347 FPS, sink logging, debug overlay, cursor and
 physical rotation through the active provider's generation-bound `SIGUSR1` channel.
 Matching receipts confirm the in-place update without restarting Xorg, Shell
 or applications. Explicit restart and touch calibration retain their existing
-lifecycle behavior.
+lifecycle behavior. The debug overlay accepts the CPU metric as bit 32; its
+default mask 39 represents `fps`, `dirty`, `bytes`, and `cpu`.
 
 Version 0.2.10 uses the single-process C11 native manager as the normal resident
 HAL and retains the Python manager/providers as idle-reaped on-demand

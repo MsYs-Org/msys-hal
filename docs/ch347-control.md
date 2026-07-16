@@ -98,7 +98,7 @@ set_fps({"fps":60,"idle_fps":1})
 get_debug({})
 set_debug({"enabled":true})
 set_debug({"overlay":{"enabled":true,"alpha":176,"scale":1,
-  "items":["fps","dirty","bytes"],"interval_ms":1000}})
+  "items":["fps","dirty","bytes","cpu"],"interval_ms":1000}})
 get_touch_calibration({})
 set_touch_calibration({"touch_calibration":{"invert_x":true}})
 restart({})
@@ -113,6 +113,8 @@ The FPS document also contains a strict `DEBUG=0|1` field. `DEBUG=1` enables
 low-rate detailed sink logging; it is not a target-FPS alias. The independent
 `debug_overlay.env` document owns the optional on-panel overlay, which defaults
 off and has bounded alpha, 1x/2x font scale, metric rows and update interval.
+Its default item mask is 39 (`fps`, `dirty`, `bytes`, `cpu`); the complete
+strict range is 1..63 for `fps`, `dirty`, `bytes`, `bbox`, `memory`, and `cpu`.
 Both debug methods return a `debug` object containing `enabled`, configured `fps`,
 `max_fps`, `idle_fps`, `applied`, `requires_restart`, and the exact
 `provider_generation` from the provider-owned runtime receipt. A changed flag
