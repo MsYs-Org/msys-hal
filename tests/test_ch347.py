@@ -2,18 +2,20 @@ from __future__ import annotations
 
 import signal
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
 from msys_hal.ch347 import (
     CALIBRATION_DEFAULTS,
     CONTROL_INTERFACE,
+    TOUCH_CALIBRATION_INTERFACE,
     DEFAULT_TARGET,
     DEVICE_ID,
     Ch347ControlBackend,
     Ch347ControlService,
 )
-from msys_hal.errors import HalError, PersistenceError, UnavailableError, ValidationError
+from msys_hal.errors import ConflictError, HalError, PersistenceError, UnavailableError, ValidationError
 
 
 def calibration_text(**overrides) -> str:
@@ -70,6 +72,30 @@ def overlay_text(
         f"CH347_DEBUG_OVERLAY_ITEMS={items}\n"
         f"CH347_DEBUG_OVERLAY_INTERVAL_MS={interval_ms}\n"
     )
+
+
+def affine_text(*, revision: int = 0, x_scale: float = 1.0, undo: bool = False) -> str:
+    current = (x_scale, 0, (1 - x_scale) / 2, 0, 1, 0, 0, 0, 1)
+    lines = [f"MSYS_TOUCH_AFFINE_REVISION={revision}"]
+    lines.extend(
+        f"CH347_TOUCH_AFFINE_{row}{column}={current[row * 3 + column]:.12g}"
+        for row in range(3) for column in range(3)
+    )
+    if undo:
+        lines.append("MSYS_TOUCH_AFFINE_UNDO_VALID=1")
+        previous = (1, 0, 0, 0, 1, 0, 0, 0, 1)
+    else:
+        lines.append("MSYS_TOUCH_AFFINE_UNDO_VALID=0")
+        previous = (1, 0, 0, 0, 1, 0, 0, 0, 1)
+    lines.extend(
+        f"MSYS_TOUCH_AFFINE_UNDO_{row}{column}={previous[row * 3 + column]:.12g}"
+        for row in range(3) for column in range(3)
+    )
+    return "\n".join(lines) + "\n"
+
+
+def effective_affine_text(*, revision: int = 0, x_scale: float = 1.0) -> str:
+    return "\n".join(affine_text(revision=revision, x_scale=x_scale).splitlines()[:10]) + "\n"
 
 
 class FakeGateway:
@@ -141,6 +167,10 @@ class Ch347ControlTests(unittest.TestCase):
             "CH347_DISPLAY_ROTATION=normal\n",
             encoding="ascii",
         )
+        (self.config / "touch_affine.env").write_text(affine_text(), encoding="ascii")
+        (self.run / "touch-affine.effective.env").write_text(
+            effective_affine_text(), encoding="ascii"
+        )
         (self.run / "pids").write_text("101\n102\n", encoding="ascii")
         (self.run / "msys.provider.owner").write_text(
             "7:900:1700000000\n",
@@ -166,6 +196,9 @@ class Ch347ControlTests(unittest.TestCase):
             "MSYS_GENERATION=7\nCH347_DISPLAY_ROTATION=normal\n",
             encoding="ascii",
         )
+        (self.run / "touch-affine.applied.env").write_text(
+            "MSYS_GENERATION=7\n" + effective_affine_text(), encoding="ascii"
+        )
         self.signals: list[tuple[int, int]] = []
         self.gateway = FakeGateway()
         self.generation = 7
@@ -190,6 +223,10 @@ class Ch347ControlTests(unittest.TestCase):
             (self.run / "rotation.applied.env").write_text(
                 f"MSYS_GENERATION={self.generation}\n{rotation}",
                 encoding="ascii",
+            )
+            affine = (self.run / "touch-affine.effective.env").read_text(encoding="ascii")
+            (self.run / "touch-affine.applied.env").write_text(
+                f"MSYS_GENERATION={self.generation}\n{affine}", encoding="ascii"
             )
             (self.run / "live.log").write_text(
                 (
@@ -674,6 +711,91 @@ class Ch347ControlTests(unittest.TestCase):
                     DEVICE_ID,
                     {"physical_rotation": invalid},
                 )
+
+    def test_transactional_affine_preview_confirm_cancel_and_undo(self) -> None:
+        service = Ch347ControlService(
+            self.backend,
+            provider_id="org.msys.hal.linux:ch347-output-control",
+        )
+        initial = service.handle("get", {})
+        self.assertEqual(initial["schema"], TOUCH_CALIBRATION_INTERFACE)
+        self.assertTrue(initial["writable"])
+        self.assertEqual(initial["geometry"], {"width": 320, "height": 480})
+
+        preview = service.handle("preview", {
+            "matrix": [0.8, 0, 0.1, 0, 1, 0, 0, 0, 1],
+            "ttl_ms": 20000,
+            "expected_revision": 0,
+            "basis": {"rotation": "normal", "width": 320, "height": 480},
+        })
+        self.assertEqual(preview["revision"], 1)
+        self.assertEqual(self.signals, [(900, signal.SIGUSR1)])
+        live = service.handle("get", {})
+        self.assertEqual(live["matrix"], [0.8, 0, 0.1, 0, 1, 0, 0, 0, 1])
+        confirmed = service.handle("confirm", {"token": preview["token"]})
+        self.assertEqual(confirmed["revision"], 1)
+        with self.assertRaises(ConflictError):
+            service.handle("confirm", {"token": preview["token"]})
+
+        second = service.handle("preview", {
+            "use_default": True,
+            "ttl_ms": 20000,
+            "expected_revision": 1,
+        })
+        cancelled = service.handle("cancel", {"token": second["token"]})
+        self.assertEqual(cancelled["revision"], 1)
+        self.assertEqual(cancelled["matrix"], [0.8, 0, 0.1, 0, 1, 0, 0, 0, 1])
+
+        undone = service.handle("undo", {})
+        self.assertEqual(undone["revision"], 2)
+        self.assertEqual(undone["matrix"], [1, 0, 0, 0, 1, 0, 0, 0, 1])
+        redone = service.handle("undo", {})
+        self.assertEqual(redone["revision"], 3)
+        self.assertEqual(redone["matrix"], [0.8, 0, 0.1, 0, 1, 0, 0, 0, 1])
+        self.assertFalse(any(
+            call[1] in {"stop", "start"} for call in self.gateway.calls
+        ))
+
+    def test_preview_rejects_stale_basis_and_rotation_cancels_active_preview(self) -> None:
+        with self.assertRaises(ConflictError):
+            self.backend.touch_calibration_preview({
+                "matrix": [1, 0, 0, 0, 1, 0, 0, 0, 1],
+                "ttl_ms": 1000,
+                "expected_revision": 0,
+                "basis": {"rotation": "right", "width": 480, "height": 320},
+            })
+        preview = self.backend.touch_calibration_preview({
+            "matrix": [0.9, 0, 0.05, 0, 1, 0, 0, 0, 1],
+            "ttl_ms": 20000,
+            "expected_revision": 0,
+            "basis": {"rotation": "normal", "width": 320, "height": 480},
+        })
+        self.backend.set_state(DEVICE_ID, {"physical_rotation": "right"})
+        with self.assertRaises(ConflictError):
+            self.backend.touch_calibration_confirm(preview["token"])
+        state = self.backend.touch_calibration_get()
+        self.assertEqual(state["matrix"], [1, 0, 0, 0, 1, 0, 0, 0, 1])
+        self.assertEqual(state["rotation"], "right")
+        self.assertEqual(state["geometry"], {"width": 480, "height": 320})
+
+    def test_preview_ttl_automatically_restores_the_verified_matrix(self) -> None:
+        preview = self.backend.touch_calibration_preview({
+            "matrix": [0.9, 0, 0.05, 0, 1, 0, 0, 0, 1],
+            "ttl_ms": 1000,
+            "expected_revision": 0,
+            "basis": {"rotation": "normal", "width": 320, "height": 480},
+        })
+        self.assertEqual(preview["revision"], 1)
+        deadline = time.monotonic() + 2.5
+        while self.backend._preview is not None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertIsNone(self.backend._preview)
+        state = self.backend.touch_calibration_get()
+        self.assertEqual(state["revision"], 0)
+        self.assertEqual(state["matrix"], [1, 0, 0, 0, 1, 0, 0, 0, 1])
+        self.assertFalse(any(
+            call[1] in {"stop", "start"} for call in self.gateway.calls
+        ))
 
     def test_missing_rotation_file_is_explicitly_read_only(self) -> None:
         (self.config / "rotation.env").unlink()

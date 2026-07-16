@@ -28,7 +28,7 @@ class ContractAndMipcTests(unittest.TestCase):
         self.assertEqual(canonical, development)
         manifest = canonical
         self.assertEqual(manifest["schema"], "msys.manifest.v1")
-        self.assertEqual(__version__, "0.2.17")
+        self.assertEqual(__version__, "0.2.18")
         self.assertEqual(manifest["package"]["version"], __version__)
         pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
         project_version = re.search(
@@ -86,7 +86,10 @@ class ContractAndMipcTests(unittest.TestCase):
             if item["id"] not in {"manager", "native-manager"}
         ]
         self.assertTrue(all(item["lifecycle"] == "on-demand" for item in providers))
-        self.assertTrue(all(item["idle_timeout_ms"] == 30000 for item in providers))
+        self.assertTrue(all(
+            item["idle_timeout_ms"] == (70000 if item["id"] == "ch347-output-control" else 30000)
+            for item in providers
+        ))
         self.assertTrue(all(any(
             provided.get("interface") == "org.msys.hal.provider.v1"
             for provided in item["provides"]
@@ -118,6 +121,11 @@ class ContractAndMipcTests(unittest.TestCase):
             provided.get("interface") == "org.msys.hal.ch347-control.v1"
             for provided in ch347["provides"]
         ))
+        self.assertTrue(any(
+            provided.get("interface") == "org.msys.hal.touch-calibration.v1"
+            for provided in ch347["provides"]
+        ))
+        self.assertEqual(ch347["idle_timeout_ms"], 70000)
         self.assertEqual(
             {
                 "mipc.call:msys.core.list_components",

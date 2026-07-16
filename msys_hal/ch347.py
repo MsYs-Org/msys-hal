@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import secrets
 import signal
 import stat
 import tempfile
@@ -12,13 +13,14 @@ from pathlib import Path
 from typing import Any, Callable, Protocol
 
 from . import __version__
-from .errors import HalError, PersistenceError, ProviderError, UnavailableError, ValidationError
+from .errors import ConflictError, HalError, PersistenceError, ProviderError, UnavailableError, ValidationError
 from .mipc import ComponentServer, PublicGateway
 from .provider import PROVIDER_INTERFACE, ProviderService
 from .validation import component_id, device_id, integer, object_payload
 
 
 CONTROL_INTERFACE = "org.msys.hal.ch347-control.v1"
+TOUCH_CALIBRATION_INTERFACE = "org.msys.hal.touch-calibration.v1"
 DOMAIN = "display-output"
 DEVICE_ID = "display-output:ch347"
 DEFAULT_TARGET = "org.msys.openstick.ch347:x11-spi-touch-output"
@@ -141,6 +143,14 @@ CALIBRATION_RANGES = {
     "pressure_max": (1, 65535),
 }
 ASSIGNMENT_RE = re.compile(r"^([A-Z][A-Z0-9_]*)=([0-9]{1,10})$")
+IDENTITY_AFFINE: tuple[int | float, ...] = (1, 0, 0, 0, 1, 0, 0, 0, 1)
+AFFINE_KEYS = tuple(
+    f"CH347_TOUCH_AFFINE_{row}{column}"
+    for row in range(3)
+    for column in range(3)
+)
+UNDO_AFFINE_KEYS = tuple(key.replace("CH347_TOUCH_AFFINE_", "MSYS_TOUCH_AFFINE_UNDO_") for key in AFFINE_KEYS)
+MAX_AFFINE_REVISION = 2**31 - 1
 
 
 class Gateway(Protocol):
@@ -218,6 +228,7 @@ class Ch347ControlBackend:
         self.process_executable = process_executable
         self.signal_process = signal_process
         self._lock = threading.RLock()
+        self._preview: dict[str, Any] | None = None
 
     @property
     def fps_path(self) -> Path:
@@ -238,6 +249,18 @@ class Ch347ControlBackend:
     @property
     def rotation_path(self) -> Path:
         return self.config_dir / "rotation.env"
+
+    @property
+    def affine_state_path(self) -> Path:
+        return self.config_dir / "touch_affine.env"
+
+    @property
+    def effective_affine_path(self) -> Path:
+        return self.run_dir / "touch-affine.effective.env"
+
+    @property
+    def applied_affine_path(self) -> Path:
+        return self.run_dir / "touch-affine.applied.env"
 
     @property
     def pid_path(self) -> Path:
@@ -733,6 +756,452 @@ class Ch347ControlBackend:
             f"CH347_DISPLAY_ROTATION={rotation}\n",
         )
 
+    @staticmethod
+    def _validated_affine(value: object, *, label: str = "matrix") -> list[int | float]:
+        if not isinstance(value, (list, tuple)) or len(value) != 9:
+            raise ValidationError(f"{label} must contain exactly nine numbers")
+        matrix: list[float] = []
+        for item in value:
+            if isinstance(item, bool) or not isinstance(item, (int, float)):
+                raise ValidationError(f"{label} contains a non-number")
+            number = float(item)
+            if not (-4.0 <= number <= 4.0) or number != number:
+                raise ValidationError(f"{label} contains an unsafe value")
+            matrix.append(number)
+        if any(abs(matrix[index]) > 1e-9 for index in (6, 7)) or abs(matrix[8] - 1.0) > 1e-9:
+            raise ValidationError(f"{label} must have final row 0,0,1")
+        determinant = matrix[0] * matrix[4] - matrix[1] * matrix[3]
+        if abs(determinant) < 1e-6:
+            raise ValidationError(f"{label} must be invertible")
+        for x, y in ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)):
+            mapped_x = matrix[0] * x + matrix[1] * y + matrix[2]
+            mapped_y = matrix[3] * x + matrix[4] * y + matrix[5]
+            if not (-1.0 <= mapped_x <= 2.0 and -1.0 <= mapped_y <= 2.0):
+                raise ValidationError(f"{label} maps outside safe normalized bounds")
+        return [int(item) if item.is_integer() else item for item in matrix]
+
+    @staticmethod
+    def _format_affine_number(value: int | float) -> str:
+        return format(float(value), ".12g")
+
+    @classmethod
+    def _affine_effective_text(
+        cls,
+        revision: int,
+        matrix: list[int | float],
+    ) -> str:
+        lines = [f"MSYS_TOUCH_AFFINE_REVISION={revision}"]
+        lines.extend(
+            f"{key}={cls._format_affine_number(value)}"
+            for key, value in zip(AFFINE_KEYS, matrix)
+        )
+        return "\n".join(lines) + "\n"
+
+    @classmethod
+    def _affine_state_text(
+        cls,
+        revision: int,
+        matrix: list[int | float],
+        previous: list[int | float] | None,
+    ) -> str:
+        lines = [
+            "# Managed atomically by MSYS HAL touch calibration",
+            cls._affine_effective_text(revision, matrix).rstrip("\n"),
+            f"MSYS_TOUCH_AFFINE_UNDO_VALID={int(previous is not None)}",
+        ]
+        previous_matrix = previous if previous is not None else list(IDENTITY_AFFINE)
+        lines.extend(
+            f"{key}={cls._format_affine_number(value)}"
+            for key, value in zip(UNDO_AFFINE_KEYS, previous_matrix)
+        )
+        return "\n".join(lines) + "\n"
+
+    @classmethod
+    def _parse_affine_document(
+        cls,
+        text: str,
+        *,
+        state: bool,
+        filename: str,
+    ) -> dict[str, Any]:
+        allowed = {
+            "MSYS_TOUCH_AFFINE_REVISION", *AFFINE_KEYS,
+            "MSYS_TOUCH_AFFINE_UNDO_VALID", *UNDO_AFFINE_KEYS,
+        }
+        values: dict[str, str] = {}
+        for line_number, raw_line in enumerate(text.splitlines(), 1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                raise ProviderError(
+                    "touch affine configuration contains an invalid line",
+                    details={"file": filename, "line": line_number},
+                )
+            key, value = line.split("=", 1)
+            if key not in allowed or not value or key in values or len(value) > 48:
+                raise ProviderError(
+                    "touch affine configuration contains an invalid assignment",
+                    details={"file": filename, "line": line_number},
+                )
+            values[key] = value
+        required = {"MSYS_TOUCH_AFFINE_REVISION", *AFFINE_KEYS}
+        if state:
+            required.update({"MSYS_TOUCH_AFFINE_UNDO_VALID", *UNDO_AFFINE_KEYS})
+        if not required.issubset(values) or (state and set(values) != required):
+            raise ProviderError(
+                "touch affine configuration is incomplete",
+                details={"file": filename, "missing": sorted(required - set(values))},
+            )
+        try:
+            revision = int(values["MSYS_TOUCH_AFFINE_REVISION"], 10)
+            matrix = cls._validated_affine(
+                [float(values[key]) for key in AFFINE_KEYS],
+                label="touch affine matrix",
+            )
+        except (ValueError, OverflowError) as exc:
+            raise ProviderError("touch affine configuration contains an invalid number") from exc
+        if not 0 <= revision <= MAX_AFFINE_REVISION:
+            raise ProviderError("touch affine revision is outside supported bounds")
+        previous: list[int | float] | None = None
+        if state:
+            undo_valid = values["MSYS_TOUCH_AFFINE_UNDO_VALID"]
+            if undo_valid not in {"0", "1"}:
+                raise ProviderError("touch affine undo flag must be 0 or 1")
+            try:
+                decoded_previous = cls._validated_affine(
+                    [float(values[key]) for key in UNDO_AFFINE_KEYS],
+                    label="touch affine undo matrix",
+                )
+            except (ValueError, OverflowError) as exc:
+                raise ProviderError("touch affine undo contains an invalid number") from exc
+            if undo_valid == "1":
+                previous = decoded_previous
+        return {"revision": revision, "matrix": matrix, "previous": previous}
+
+    def _load_affine_file(self, path: Path, *, state: bool) -> dict[str, Any] | None:
+        text = self._read_regular(path)
+        if text is None:
+            return None
+        return self._parse_affine_document(text, state=state, filename=path.name)
+
+    def _atomic_write_runtime(self, path: Path, content: str) -> None:
+        data = content.encode("ascii", "strict")
+        if len(data) > MAX_CONFIG_BYTES:
+            raise PersistenceError("touch affine runtime output is too large")
+        directory = path.parent
+        try:
+            info = directory.lstat()
+        except OSError as exc:
+            raise PersistenceError("CH347 runtime directory is unavailable") from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise PersistenceError("CH347 runtime directory is unsafe")
+        try:
+            target = path.lstat()
+        except FileNotFoundError:
+            target = None
+        except OSError as exc:
+            raise PersistenceError("touch affine runtime target cannot be inspected") from exc
+        if target is not None and (stat.S_ISLNK(target.st_mode) or not stat.S_ISREG(target.st_mode)):
+            raise PersistenceError("touch affine runtime target is unsafe")
+        temporary = ""
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb", dir=directory, prefix=f".{path.name}.", delete=False
+            ) as stream:
+                temporary = stream.name
+                if os.name != "nt":
+                    os.chmod(temporary, 0o600)
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+            temporary = ""
+        except OSError as exc:
+            raise PersistenceError("touch affine runtime state could not be committed") from exc
+        finally:
+            if temporary:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
+
+    def _basis_snapshot(self) -> dict[str, Any]:
+        rotation, rotation_error, provisioned = self._load_rotation()
+        calibration, calibration_error = self._load_calibration()
+        if rotation_error or calibration_error or not provisioned:
+            raise UnavailableError("touch calibration basis is unavailable")
+        width = calibration["width"]
+        height = calibration["height"]
+        if rotation in {"right", "left"}:
+            width, height = height, width
+        return {"rotation": rotation, "width": width, "height": height}
+
+    @staticmethod
+    def _validate_basis(value: object) -> dict[str, Any]:
+        if not isinstance(value, dict) or set(value) != {"rotation", "width", "height"}:
+            raise ValidationError("basis must contain rotation, width and height")
+        rotation = value["rotation"]
+        if not isinstance(rotation, str) or rotation not in PHYSICAL_ROTATIONS:
+            raise ValidationError("basis rotation is invalid")
+        return {
+            "rotation": rotation,
+            "width": integer(value["width"], "basis width", minimum=1, maximum=8192),
+            "height": integer(value["height"], "basis height", minimum=1, maximum=8192),
+        }
+
+    def _load_applied_affine(self) -> dict[str, Any] | None:
+        text = self._read_regular(self.applied_affine_path)
+        if text is None:
+            return None
+        lines = text.splitlines()
+        if not lines or not re.fullmatch(r"MSYS_GENERATION=[0-9]{1,10}", lines[0]):
+            raise ProviderError("touch affine applied receipt is invalid")
+        generation = int(lines[0].split("=", 1)[1], 10)
+        active_generation, _pid = self._active_provider()
+        if generation != active_generation:
+            raise ProviderError("touch affine receipt belongs to a stale generation")
+        result = self._parse_affine_document(
+            "\n".join(lines[1:]) + "\n",
+            state=False,
+            filename=self.applied_affine_path.name,
+        )
+        result["provider_generation"] = generation
+        return result
+
+    @staticmethod
+    def _matrix_equal(left: list[int | float], right: list[int | float]) -> bool:
+        return all(abs(float(a) - float(b)) <= 1e-9 for a, b in zip(left, right))
+
+    def _affine_applied(self, revision: int, matrix: list[int | float]) -> bool:
+        receipt = self._load_applied_affine()
+        return bool(
+            receipt is not None
+            and receipt["revision"] == revision
+            and self._matrix_equal(receipt["matrix"], matrix)
+        )
+
+    def _apply_affine(self, revision: int, matrix: list[int | float]) -> None:
+        self._atomic_write_runtime(
+            self.effective_affine_path,
+            self._affine_effective_text(revision, matrix),
+        )
+        self._reload_runtime()
+        if not self._affine_applied(revision, matrix):
+            raise ProviderError("touch affine runtime readback did not match the request")
+
+    def touch_calibration_get(self) -> dict[str, Any]:
+        with self._lock:
+            persistent = self._load_affine_file(self.affine_state_path, state=True)
+            effective = self._load_affine_file(self.effective_affine_path, state=False)
+            basis = self._basis_snapshot()
+            applied = False
+            if effective is not None:
+                try:
+                    applied = self._affine_applied(
+                        effective["revision"], effective["matrix"]
+                    )
+                except HalError:
+                    applied = False
+            writable = persistent is not None and effective is not None and applied
+            reason = None
+            if persistent is None:
+                reason = "touch affine state is not provisioned"
+            elif effective is None:
+                reason = "CH347 display output is not running"
+            elif not applied:
+                reason = "CH347 touch affine is not applied by the active generation"
+            result = {
+                "schema": TOUCH_CALIBRATION_INTERFACE,
+                "provider": self.target_component,
+                "revision": (effective or persistent or {"revision": 0})["revision"],
+                "writable": writable,
+                "matrix": (effective or persistent or {"matrix": list(IDENTITY_AFFINE)})["matrix"],
+                "default_matrix": list(IDENTITY_AFFINE),
+                "rotation": basis["rotation"],
+                "geometry": {"width": basis["width"], "height": basis["height"]},
+            }
+            if reason:
+                result["reason"] = reason
+            return result
+
+    def _require_preview(self, token: object) -> dict[str, Any]:
+        if not isinstance(token, str) or not 16 <= len(token) <= 64 or not token.isascii():
+            raise ValidationError("preview token is invalid")
+        preview = self._preview
+        if preview is None or not secrets.compare_digest(preview["token"], token):
+            raise ConflictError("preview token is stale or already consumed")
+        return preview
+
+    def _clear_preview(self, preview: dict[str, Any]) -> None:
+        preview["stop"].set()
+        if self._preview is preview:
+            self._preview = None
+
+    def _restore_preview_locked(self, preview: dict[str, Any]) -> dict[str, Any]:
+        self._apply_affine(preview["saved_revision"], preview["saved_matrix"])
+        self._clear_preview(preview)
+        return self.touch_calibration_get()
+
+    def _preview_watch(self, token: str, stop: threading.Event) -> None:
+        while not stop.wait(0.25):
+            with self._lock:
+                preview = self._preview
+                if preview is None or preview["token"] != token:
+                    return
+                expired = time.monotonic() >= preview["deadline"]
+                try:
+                    basis_changed = self._basis_snapshot() != preview["basis"]
+                except HalError:
+                    basis_changed = True
+                if expired or basis_changed:
+                    try:
+                        self._restore_preview_locked(preview)
+                    except HalError as exc:
+                        print(f"msys-hal: touch preview rollback failed: {exc.message}", flush=True)
+                    return
+
+    def touch_calibration_preview(self, request: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            if self._preview is not None:
+                raise ConflictError("a touch calibration preview is already active")
+            current = self.touch_calibration_get()
+            if not current["writable"]:
+                raise UnavailableError(current.get("reason", "touch calibration is read-only"))
+            expected = integer(
+                request.get("expected_revision"),
+                "expected_revision",
+                minimum=0,
+                maximum=MAX_AFFINE_REVISION,
+            )
+            if expected != current["revision"]:
+                raise ConflictError(
+                    "touch calibration revision changed",
+                    details={"expected_revision": expected, "revision": current["revision"]},
+                )
+            ttl_ms = integer(request.get("ttl_ms"), "ttl_ms", minimum=1000, maximum=60000)
+            use_default = request.get("use_default", False)
+            if not isinstance(use_default, bool):
+                raise ValidationError("use_default must be a boolean")
+            if use_default:
+                if "matrix" in request or "basis" in request:
+                    raise ValidationError("use_default cannot be combined with matrix or basis")
+                matrix = list(IDENTITY_AFFINE)
+                basis = self._basis_snapshot()
+            else:
+                if "matrix" not in request or "basis" not in request:
+                    raise ValidationError("preview requires matrix and basis")
+                matrix = self._validated_affine(request["matrix"])
+                basis = self._validate_basis(request["basis"])
+                if basis != self._basis_snapshot():
+                    raise ConflictError("touch calibration basis changed")
+            if current["revision"] >= MAX_AFFINE_REVISION:
+                raise ConflictError("touch calibration revision is exhausted")
+            revision = current["revision"] + 1
+            saved_revision = current["revision"]
+            saved_matrix = list(current["matrix"])
+            try:
+                self._apply_affine(revision, matrix)
+            except HalError:
+                try:
+                    self._apply_affine(saved_revision, saved_matrix)
+                except HalError as rollback:
+                    raise ProviderError(
+                        "touch preview failed and runtime rollback also failed",
+                        details={"rollback": rollback.message},
+                    ) from rollback
+                raise
+            token = secrets.token_urlsafe(18)
+            stop = threading.Event()
+            preview = {
+                "token": token,
+                "revision": revision,
+                "matrix": matrix,
+                "saved_revision": saved_revision,
+                "saved_matrix": saved_matrix,
+                "basis": basis,
+                "deadline": time.monotonic() + ttl_ms / 1000.0,
+                "stop": stop,
+            }
+            self._preview = preview
+            threading.Thread(
+                target=self._preview_watch,
+                args=(token, stop),
+                daemon=True,
+                name="msys-touch-preview",
+            ).start()
+            return {"token": token, "ttl_ms": ttl_ms, "revision": revision}
+
+    def touch_calibration_confirm(self, token: object) -> dict[str, Any]:
+        with self._lock:
+            preview = self._require_preview(token)
+            if time.monotonic() >= preview["deadline"]:
+                self._restore_preview_locked(preview)
+                raise ConflictError("touch calibration preview expired")
+            if self._basis_snapshot() != preview["basis"]:
+                self._restore_preview_locked(preview)
+                raise ConflictError("touch calibration basis changed; preview was cancelled")
+            if not self._affine_applied(preview["revision"], preview["matrix"]):
+                self._restore_preview_locked(preview)
+                raise ProviderError("touch preview is no longer effective")
+            self._atomic_write(
+                self.affine_state_path,
+                self._affine_state_text(
+                    preview["revision"], preview["matrix"], preview["saved_matrix"]
+                ),
+            )
+            self._clear_preview(preview)
+            return self.touch_calibration_get()
+
+    def touch_calibration_cancel(self, token: object) -> dict[str, Any]:
+        with self._lock:
+            return self._restore_preview_locked(self._require_preview(token))
+
+    def touch_calibration_undo(self) -> dict[str, Any]:
+        with self._lock:
+            if self._preview is not None:
+                raise ConflictError("cancel or confirm the active preview before undo")
+            state = self._load_affine_file(self.affine_state_path, state=True)
+            if state is None or state["previous"] is None:
+                raise ConflictError("no previous touch calibration is available")
+            if state["revision"] >= MAX_AFFINE_REVISION:
+                raise ConflictError("touch calibration revision is exhausted")
+            revision = state["revision"] + 1
+            previous = state["previous"]
+            self._apply_affine(revision, previous)
+            try:
+                self._atomic_write(
+                    self.affine_state_path,
+                    self._affine_state_text(revision, previous, state["matrix"]),
+                )
+            except HalError:
+                self._apply_affine(state["revision"], state["matrix"])
+                raise
+            return self.touch_calibration_get()
+
+    def recover_stale_preview(self) -> None:
+        """Restore persisted state after an unclean on-demand provider exit."""
+
+        with self._lock:
+            persistent = self._load_affine_file(self.affine_state_path, state=True)
+            effective = self._load_affine_file(self.effective_affine_path, state=False)
+            if persistent is None or effective is None:
+                return
+            if (
+                persistent["revision"] != effective["revision"]
+                or not self._matrix_equal(persistent["matrix"], effective["matrix"])
+            ):
+                self._apply_affine(persistent["revision"], persistent["matrix"])
+
+    def close(self) -> None:
+        with self._lock:
+            preview = self._preview
+            if preview is not None:
+                try:
+                    self._restore_preview_locked(preview)
+                except HalError as exc:
+                    print(f"msys-hal: touch preview exit rollback failed: {exc.message}", flush=True)
+
     def _pid_rows(self) -> list[int]:
         try:
             raw = self._read_regular(self.pid_path)
@@ -985,6 +1454,7 @@ class Ch347ControlBackend:
         configured_overlay, overlay_error = self._load_debug_overlay()
         configured_cursor, cursor_error = self._load_cursor()
         configured_rotation, rotation_error, rotation_provisioned = self._load_rotation()
+        configured_affine = self._load_affine_file(self.effective_affine_path, state=False)
         if (
             fps_error
             or overlay_error
@@ -999,6 +1469,9 @@ class Ch347ControlBackend:
         applied_overlay, _ = self._load_applied_debug_overlay()
         applied_cursor, _ = self._load_applied_cursor()
         applied_rotation, _ = self._load_applied_rotation()
+        applied_affine = (
+            self._load_applied_affine() if configured_affine is not None else None
+        )
         return bool(
             applied_fps is not None
             and applied_overlay is not None
@@ -1014,6 +1487,16 @@ class Ch347ControlBackend:
             )
             and applied_cursor["enabled"] == configured_cursor
             and applied_rotation["rotation"] == configured_rotation
+            and (
+                configured_affine is None
+                or (
+                    applied_affine is not None
+                    and applied_affine["revision"] == configured_affine["revision"]
+                    and self._matrix_equal(
+                        applied_affine["matrix"], configured_affine["matrix"]
+                    )
+                )
+            )
         )
 
     def _reload_runtime(self, *, timeout: float = 5.0) -> None:
@@ -1538,6 +2021,8 @@ class Ch347ControlBackend:
             calibration = current_calibration
             calibration_changed = "touch_calibration" in changes
             if calibration_changed:
+                if self._preview is not None:
+                    self._restore_preview_locked(self._preview)
                 calibration = self._validated_calibration(
                     changes["touch_calibration"],
                     partial=True,
@@ -1545,6 +2030,8 @@ class Ch347ControlBackend:
                 )
             rotation_changed = "physical_rotation" in changes
             if rotation_changed:
+                if self._preview is not None:
+                    self._restore_preview_locked(self._preview)
                 _current_rotation, _rotation_error, rotation_provisioned = (
                     self._load_rotation()
                 )
@@ -1618,6 +2105,7 @@ class Ch347ControlService:
                 "display-output.status",
                 "display-output.touch-calibration",
                 "display-output.touch-calibration.write",
+                "display-output.touch-calibration.transactional-preview",
             ],
         )
 
@@ -1631,6 +2119,25 @@ class Ch347ControlService:
         }
 
     def handle(self, method: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if method == "get":
+            object_payload(payload, allowed=())
+            return self.backend.touch_calibration_get()
+        if method == "preview":
+            request = object_payload(
+                payload,
+                allowed=("matrix", "ttl_ms", "expected_revision", "basis", "use_default"),
+                required=("ttl_ms", "expected_revision"),
+            )
+            return self.backend.touch_calibration_preview(request)
+        if method == "confirm":
+            request = object_payload(payload, allowed=("token",), required=("token",))
+            return self.backend.touch_calibration_confirm(request["token"])
+        if method == "cancel":
+            request = object_payload(payload, allowed=("token",), required=("token",))
+            return self.backend.touch_calibration_cancel(request["token"])
+        if method == "undo":
+            object_payload(payload, allowed=())
+            return self.backend.touch_calibration_undo()
         if method in {"describe", "inventory", "get_state", "set_state"}:
             return self.provider.handle(method, payload)
         if method == "status":
@@ -1776,16 +2283,32 @@ def main(argv: list[str] | None = None) -> int:
         run_dir=Path(args.run_dir),
         target_component=args.target_component,
     )
+    try:
+        backend.recover_stale_preview()
+    except HalError as exc:
+        print(f"msys-hal: stale touch preview recovery unavailable: {exc.message}", flush=True)
     provider_id = os.environ.get(
         "MSYS_COMPONENT_ID",
         "org.msys.hal.linux:ch347-output-control",
     )
     service = Ch347ControlService(backend, provider_id=provider_id)
     server = ComponentServer(service.handle, workers=4)
-    return server.run(ready_event=(
-        "msys.hal.provider.ready",
-        {"provider": provider_id, "domains": [DOMAIN]},
-    ))
+    previous_handlers: dict[int, Any] = {}
+
+    def terminate(_signum: int, _frame: Any) -> None:
+        raise SystemExit(0)
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous_handlers[signum] = signal.signal(signum, terminate)
+    try:
+        return server.run(ready_event=(
+            "msys.hal.provider.ready",
+            {"provider": provider_id, "domains": [DOMAIN]},
+        ))
+    finally:
+        backend.close()
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
 
 
 if __name__ == "__main__":

@@ -15,7 +15,8 @@ separate `storage` role. A board-specific native provider is an
 ordinary language-neutral MSYS package and may outrank or be selected instead
 of one reference domain.
 
-Version 0.2.17 adds the `storage` role and
+Version 0.2.18 adds transactional CH347 touch-affine calibration while retaining
+the `storage` role and
 `org.msys.hal.storage.v1` directly to the existing small C HAL process; it does
 not keep another Python runtime resident. It discovers removable TF/SD/USB
 block devices from

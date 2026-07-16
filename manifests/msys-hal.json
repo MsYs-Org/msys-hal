@@ -3,7 +3,7 @@
   "package": {
     "id": "org.msys.hal.linux",
     "name": "MSYS Linux HAL",
-    "version": "0.2.17",
+    "version": "0.2.18",
     "kind": "system",
     "summary": "Replaceable hardware abstraction manager and safe Linux providers",
     "x-msys-i18n": {
@@ -240,13 +240,15 @@
       "runtime": "python",
       "exec": ["python", "-m", "msys_hal.ch347"],
       "lifecycle": "on-demand",
-      "idle_timeout_ms": 30000,
+      "idle_timeout_ms": 70000,
       "restart": "on-failure",
       "readiness": {"mode": "mipc-ready", "timeout_ms": 5000},
       "isolation": "baseline",
       "provides": [
         {"interface": "org.msys.hal.provider.v1", "exclusive": false, "priority": 100},
         {"interface": "org.msys.hal.ch347-control.v1", "exclusive": false, "priority": 100},
+        {"interface": "org.msys.hal.touch-calibration.v1", "exclusive": false, "priority": 100},
+        {"capability": "hal.input.touch-calibration", "exclusive": false, "priority": 100},
         {"capability": "hal.display-output.ch347", "exclusive": false, "priority": 100}
       ],
       "permissions": [
@@ -255,6 +257,7 @@
         "mipc.call:msys.core.start",
         "state:org.msys.openstick.ch347:read-write",
         "runtime:read:ch347",
+        "runtime:write:ch347-touch-affine",
         "procfs:read:ch347-processes",
         "process:signal:ch347-capture",
         "mipc.event:publish:msys.hal.provider.ready"
