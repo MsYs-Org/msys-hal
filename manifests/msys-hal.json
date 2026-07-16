@@ -3,9 +3,14 @@
   "package": {
     "id": "org.msys.hal.linux",
     "name": "MSYS Linux HAL",
-    "version": "0.2.16",
+    "version": "0.2.17",
     "kind": "system",
-    "summary": "Replaceable hardware abstraction manager and safe Linux providers"
+    "summary": "Replaceable hardware abstraction manager and safe Linux providers",
+    "x-msys-i18n": {
+      "catalog": "files/share/i18n/catalog.json",
+      "name_key": "package.name",
+      "summary_key": "package.summary"
+    }
   },
   "components": [
     {
@@ -27,7 +32,11 @@
           }
         },
         {"interface": "org.msys.hal.manager.v1", "exclusive": false, "priority": 200},
-        {"capability": "hal.native.phase1", "exclusive": false, "priority": 200}
+        {"capability": "hal.native.phase1", "exclusive": false, "priority": 200},
+        {"role": "storage", "exclusive": true, "priority": 200},
+        {"interface": "org.msys.hal.storage.v1", "exclusive": false, "priority": 200},
+        {"capability": "hal.storage", "exclusive": false, "priority": 200},
+        {"capability": "storage.automount", "exclusive": false, "priority": 200}
       ],
       "permissions": [
         "sysfs:read:power_supply",
@@ -39,8 +48,14 @@
         "sysfs:read:bluetooth",
         "sysfs:read:rfkill",
         "sysfs:write:rfkill.soft",
+        "sysfs:read:block",
+        "procfs:read:mountinfo",
+        "device:block:removable",
+        "mount:removable-storage",
+        "state:storage:read-write",
         "runtime:connect:wpa-supplicant-control",
-        "mipc.event:publish:msys.hal.changed"
+        "mipc.event:publish:msys.hal.changed",
+        "mipc.event:publish:msys.hal.storage.changed"
       ]
     },
     {

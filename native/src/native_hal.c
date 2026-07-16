@@ -1,3 +1,4 @@
+#define _XOPEN_SOURCE 700
 #define _POSIX_C_SOURCE 200809L
 
 #include "msys/mipc.h"
@@ -16,11 +17,14 @@
 #include <string.h>
 #include <stddef.h>
 #include <poll.h>
+#include <linux/netlink.h>
+#include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -31,7 +35,7 @@
 #define O_NOFOLLOW 0
 #endif
 
-#define HAL_VERSION "0.2.16"
+#define HAL_VERSION "0.2.17"
 #define MANAGER_SCHEMA "org.msys.hal.manager.v1"
 #define NATIVE_SCHEMA "org.msys.hal.native-manager.v1"
 #define COMPONENT_ID "org.msys.hal.linux:native-manager"
@@ -70,6 +74,9 @@
 #define MGMT_DISCOVERY_ALL 0x07u
 #define MGMT_PACKET_CAPACITY 4096u
 #define MAX_BLUETOOTH_DISCOVERED 24u
+#define MAX_STORAGE_VOLUMES 32u
+#define STORAGE_PATH_CAPACITY 384u
+#define STORAGE_INTERFACE "org.msys.hal.storage.v1"
 
 typedef struct {
     uint16_t family;
@@ -163,12 +170,54 @@ typedef struct {
     size_t count;
 } DeviceList;
 
+typedef struct {
+    char id[MAX_NAME + 10];
+    char name[MAX_NAME + 1];
+    char source[STORAGE_PATH_CAPACITY];
+    char parent[MAX_NAME + 1];
+    char transport[16];
+    char label[MAX_NAME + 1];
+    char uuid[MAX_NAME + 1];
+    char major_minor[32];
+    char mount_point[STORAGE_PATH_CAPACITY];
+    char preferred_mount_point[STORAGE_PATH_CAPACITY];
+    char filesystem[32];
+    char error_code[48];
+    char error_reason[160];
+    uint64_t size_bytes;
+    int read_only;
+    int mounted;
+    int managed;
+} StorageVolume;
+
+typedef struct {
+    StorageVolume items[MAX_STORAGE_VOLUMES];
+    size_t count;
+} StorageList;
+
+typedef struct {
+    char name[MAX_NAME + 1];
+    char code[48];
+    char reason[160];
+} StorageError;
+
 static const char *const DOMAINS[DOMAIN_COUNT] = {
     "power", "thermal", "backlight", "display", "display-output", "input",
     "network", "bluetooth"
 };
 
 static uint64_t revision_number = 0;
+static uint64_t storage_revision = 0;
+static StorageList storage_cache;
+static int storage_auto_mount = 1;
+static int storage_config_loaded = 0;
+static char storage_config_error[64];
+static char storage_attempted[MAX_STORAGE_VOLUMES][MAX_NAME + 1];
+static size_t storage_attempted_count = 0u;
+static char storage_suppressed[MAX_STORAGE_VOLUMES][MAX_NAME + 1];
+static size_t storage_suppressed_count = 0u;
+static StorageError storage_errors[MAX_STORAGE_VOLUMES];
+static size_t storage_error_count = 0u;
 
 static size_t utf8_sequence_length(const unsigned char *cursor);
 static size_t list_entries(
@@ -1684,6 +1733,795 @@ static size_t list_entries(
     (void)closedir(directory);
     qsort(names, count, sizeof(names[0]), compare_names);
     return count;
+}
+
+static int storage_valid_name(const char *name)
+{
+    const char *cursor = name;
+    size_t letters = 0u;
+    size_t digits = 0u;
+    if (strncmp(cursor, "sd", 2u) == 0) {
+        cursor += 2;
+        while (*cursor >= 'a' && *cursor <= 'z' && letters < 4u) {
+            ++cursor;
+            ++letters;
+        }
+        if (letters == 0u || (*cursor >= 'a' && *cursor <= 'z')) {
+            return 0;
+        }
+        while (isdigit((unsigned char)*cursor) != 0 && digits < 3u) {
+            ++cursor;
+            ++digits;
+        }
+        return *cursor == '\0';
+    }
+    if (strncmp(cursor, "mmcblk", 6u) == 0) {
+        cursor += 6;
+        while (isdigit((unsigned char)*cursor) != 0 && digits < 3u) {
+            ++cursor;
+            ++digits;
+        }
+        if (digits == 0u || isdigit((unsigned char)*cursor) != 0) {
+            return 0;
+        }
+        if (*cursor == '\0') {
+            return 1;
+        }
+        if (*cursor++ != 'p') {
+            return 0;
+        }
+        digits = 0u;
+        while (isdigit((unsigned char)*cursor) != 0 && digits < 3u) {
+            ++cursor;
+            ++digits;
+        }
+        return digits > 0u && *cursor == '\0';
+    }
+    return 0;
+}
+
+static int storage_base_name(const char *name, char *output, size_t capacity)
+{
+    const char *cursor;
+    size_t length;
+    if (!storage_valid_name(name)) {
+        return 0;
+    }
+    if (strncmp(name, "sd", 2u) == 0) {
+        cursor = name + 2;
+        while (*cursor >= 'a' && *cursor <= 'z') {
+            ++cursor;
+        }
+    } else {
+        cursor = strchr(name + 6, 'p');
+        if (cursor == NULL) {
+            cursor = name + strlen(name);
+        }
+    }
+    length = (size_t)(cursor - name);
+    if (length == 0u || length >= capacity) {
+        return 0;
+    }
+    memcpy(output, name, length);
+    output[length] = '\0';
+    return 1;
+}
+
+static int storage_list_contains(
+    char values[MAX_STORAGE_VOLUMES][MAX_NAME + 1],
+    size_t count,
+    const char *name
+)
+{
+    size_t index;
+    for (index = 0u; index < count; ++index) {
+        if (strcmp(values[index], name) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void storage_list_add(
+    char values[MAX_STORAGE_VOLUMES][MAX_NAME + 1],
+    size_t *count,
+    const char *name
+)
+{
+    if (*count >= MAX_STORAGE_VOLUMES || storage_list_contains(values, *count, name)) {
+        return;
+    }
+    (void)snprintf(values[*count], MAX_NAME + 1u, "%s", name);
+    ++*count;
+}
+
+static void storage_list_remove(
+    char values[MAX_STORAGE_VOLUMES][MAX_NAME + 1],
+    size_t *count,
+    const char *name
+)
+{
+    size_t index;
+    for (index = 0u; index < *count; ++index) {
+        if (strcmp(values[index], name) == 0) {
+            if (index + 1u < *count) {
+                memmove(&values[index], &values[index + 1u], (*count - index - 1u) * sizeof(values[0]));
+            }
+            --*count;
+            return;
+        }
+    }
+}
+
+static void storage_set_error(const char *name, const char *code, const char *reason)
+{
+    size_t index;
+    StorageError *error = NULL;
+    for (index = 0u; index < storage_error_count; ++index) {
+        if (strcmp(storage_errors[index].name, name) == 0) {
+            error = &storage_errors[index];
+            break;
+        }
+    }
+    if (error == NULL && storage_error_count < MAX_STORAGE_VOLUMES) {
+        error = &storage_errors[storage_error_count++];
+    }
+    if (error != NULL) {
+        (void)snprintf(error->name, sizeof(error->name), "%s", name);
+        (void)snprintf(error->code, sizeof(error->code), "%s", code);
+        (void)snprintf(error->reason, sizeof(error->reason), "%s", reason);
+    }
+}
+
+static void storage_clear_error(const char *name)
+{
+    size_t index;
+    for (index = 0u; index < storage_error_count; ++index) {
+        if (strcmp(storage_errors[index].name, name) == 0) {
+            if (index + 1u < storage_error_count) {
+                memmove(
+                    &storage_errors[index],
+                    &storage_errors[index + 1u],
+                    (storage_error_count - index - 1u) * sizeof(storage_errors[0])
+                );
+            }
+            --storage_error_count;
+            return;
+        }
+    }
+}
+
+static void storage_apply_error(StorageVolume *volume)
+{
+    size_t index;
+    for (index = 0u; index < storage_error_count; ++index) {
+        if (strcmp(storage_errors[index].name, volume->name) == 0) {
+            (void)snprintf(volume->error_code, sizeof(volume->error_code), "%s", storage_errors[index].code);
+            (void)snprintf(volume->error_reason, sizeof(volume->error_reason), "%s", storage_errors[index].reason);
+            return;
+        }
+    }
+}
+
+static int storage_explicitly_allowed(const char *base, const char *name)
+{
+    const char *configured = getenv("MSYS_HAL_STORAGE_ALLOW");
+    const char *cursor;
+    if (configured == NULL || *configured == '\0') {
+        return 0;
+    }
+    cursor = configured;
+    while (*cursor != '\0') {
+        const char *end = strchr(cursor, ',');
+        size_t length = end == NULL ? strlen(cursor) : (size_t)(end - cursor);
+        if ((strlen(base) == length && memcmp(cursor, base, length) == 0) ||
+            (strlen(name) == length && memcmp(cursor, name, length) == 0)) {
+            return 1;
+        }
+        if (end == NULL) {
+            break;
+        }
+        cursor = end + 1;
+    }
+    return 0;
+}
+
+static const char *storage_mount_root(void)
+{
+    const char *value = getenv("MSYS_HAL_STORAGE_MOUNT_ROOT");
+    if (value == NULL || value[0] != '/' || strlen(value) >= STORAGE_PATH_CAPACITY / 2u ||
+        strstr(value, "/../") != NULL || strstr(value, "/./") != NULL ||
+        strcmp(value, "/") == 0 || value[strlen(value) - 1u] == '/') {
+        return "/media/msys";
+    }
+    return value;
+}
+
+static int storage_is_partition(const char *root, const char *name)
+{
+    char path[PATH_MAX];
+    struct stat status;
+    return join_path(path, sizeof(path), root, name, "partition") &&
+           stat(path, &status) == 0 && S_ISREG(status.st_mode);
+}
+
+static int storage_parent_allowed(
+    const char *root,
+    const char *base,
+    const char *name,
+    char transport[16]
+)
+{
+    char path[PATH_MAX];
+    char resolved[PATH_MAX];
+    int64_t removable;
+    if (storage_explicitly_allowed(base, name)) {
+        (void)snprintf(transport, 16u, "configured");
+        return 1;
+    }
+    if (join_path(path, sizeof(path), root, base, "removable") &&
+        read_i64_file(path, 0, 1, &removable) && removable == 1) {
+        (void)snprintf(transport, 16u, "%s", strncmp(base, "mmcblk", 6u) == 0 ? "sd" : "removable");
+        return 1;
+    }
+    if (join_path(path, sizeof(path), root, name, NULL) &&
+        realpath(path, resolved) != NULL && strstr(resolved, "/usb") != NULL) {
+        (void)snprintf(transport, 16u, "usb");
+        return 1;
+    }
+    return 0;
+}
+
+static void storage_decode_mount_path(char *value)
+{
+    char *read_cursor = value;
+    char *write_cursor = value;
+    while (*read_cursor != '\0') {
+        if (read_cursor[0] == '\\' &&
+            read_cursor[1] >= '0' && read_cursor[1] <= '7' &&
+            read_cursor[2] >= '0' && read_cursor[2] <= '7' &&
+            read_cursor[3] >= '0' && read_cursor[3] <= '7') {
+            *write_cursor++ = (char)(
+                (read_cursor[1] - '0') * 64 +
+                (read_cursor[2] - '0') * 8 +
+                (read_cursor[3] - '0')
+            );
+            read_cursor += 4;
+        } else {
+            *write_cursor++ = *read_cursor++;
+        }
+    }
+    *write_cursor = '\0';
+}
+
+static int storage_mount_for(
+    const char *major_minor,
+    char *mount_point,
+    size_t mount_capacity,
+    char *filesystem,
+    size_t filesystem_capacity
+)
+{
+    const char *path = root_path("MSYS_HAL_MOUNTINFO", "/proc/self/mountinfo");
+    FILE *stream = fopen(path, "r");
+    char line[2048];
+    if (stream == NULL) {
+        return 0;
+    }
+    while (fgets(line, sizeof(line), stream) != NULL) {
+        char *save = NULL;
+        char *token;
+        char *fields[96];
+        size_t count = 0u;
+        size_t index;
+        for (token = strtok_r(line, " \t\r\n", &save);
+             token != NULL && count < sizeof(fields) / sizeof(fields[0]);
+             token = strtok_r(NULL, " \t\r\n", &save)) {
+            fields[count++] = token;
+        }
+        if (count < 10u || strcmp(fields[2], major_minor) != 0) {
+            continue;
+        }
+        for (index = 6u; index < count; ++index) {
+            if (strcmp(fields[index], "-") == 0 && index + 2u < count) {
+                (void)snprintf(mount_point, mount_capacity, "%s", fields[4]);
+                storage_decode_mount_path(mount_point);
+                (void)snprintf(filesystem, filesystem_capacity, "%s", fields[index + 1u]);
+                (void)fclose(stream);
+                return 1;
+            }
+        }
+    }
+    (void)fclose(stream);
+    return 0;
+}
+
+static int storage_critical_mount(const char *major_minor)
+{
+    char mount_point[STORAGE_PATH_CAPACITY];
+    char filesystem[32];
+    if (!storage_mount_for(
+            major_minor,
+            mount_point,
+            sizeof(mount_point),
+            filesystem,
+            sizeof(filesystem))) {
+        return 0;
+    }
+    return strcmp(mount_point, "/") == 0 ||
+           strcmp(mount_point, "/boot") == 0 ||
+           strcmp(mount_point, "/usr") == 0 ||
+           strcmp(mount_point, "/var") == 0 ||
+           strcmp(mount_point, "/opt") == 0 ||
+           strcmp(mount_point, "/home") == 0;
+}
+
+static void storage_alias_for(
+    const char *environment,
+    const char *fallback,
+    const char *source,
+    char *output,
+    size_t capacity
+)
+{
+    const char *root = root_path(environment, fallback);
+    DIR *directory = opendir(root);
+    struct dirent *entry;
+    char source_real[PATH_MAX];
+    output[0] = '\0';
+    if (directory == NULL || realpath(source, source_real) == NULL) {
+        if (directory != NULL) {
+            (void)closedir(directory);
+        }
+        return;
+    }
+    while ((entry = readdir(directory)) != NULL) {
+        char path[PATH_MAX];
+        char target[PATH_MAX];
+        if (!valid_name(entry->d_name) ||
+            !join_path(path, sizeof(path), root, entry->d_name, NULL) ||
+            realpath(path, target) == NULL || strcmp(source_real, target) != 0) {
+            continue;
+        }
+        {
+            size_t length = strlen(entry->d_name);
+            if (length >= capacity) {
+                continue;
+            }
+            memcpy(output, entry->d_name, length + 1u);
+        }
+        break;
+    }
+    (void)closedir(directory);
+}
+
+static void storage_slug(const char *value, const char *fallback, char output[MAX_NAME + 1])
+{
+    size_t written = 0u;
+    int pending_dash = 0;
+    const unsigned char *cursor = (const unsigned char *)value;
+    while (*cursor != '\0' && written < MAX_NAME) {
+        unsigned char character = *cursor++;
+        if (isalnum(character) != 0 || character == '.' || character == '_' || character == '-') {
+            if (pending_dash && written > 0u && written < MAX_NAME) {
+                output[written++] = '-';
+            }
+            output[written++] = (char)character;
+            pending_dash = 0;
+        } else if (isspace(character) != 0) {
+            pending_dash = 1;
+        }
+    }
+    while (written > 0u && (output[written - 1u] == '.' || output[written - 1u] == '-')) {
+        --written;
+    }
+    output[written] = '\0';
+    if (written == 0u || strcmp(output, ".") == 0 || strcmp(output, "..") == 0) {
+        (void)snprintf(output, MAX_NAME + 1u, "%s", fallback);
+    }
+}
+
+static int storage_source_usable(const char *path)
+{
+    struct stat status;
+    int test_mode = getenv("MSYS_HAL_STORAGE_TEST") != NULL;
+    return stat(path, &status) == 0 && (S_ISBLK(status.st_mode) || test_mode);
+}
+
+static void storage_scan(StorageList *volumes)
+{
+    const char *root = root_path("MSYS_HAL_BLOCK_ROOT", "/sys/class/block");
+    const char *dev_root = root_path("MSYS_HAL_DEV_ROOT", "/dev");
+    const char *mount_root = storage_mount_root();
+    char names[MAX_ENTRIES][MAX_NAME + 1];
+    char partitioned[MAX_ENTRIES][MAX_NAME + 1];
+    char critical[MAX_ENTRIES][MAX_NAME + 1];
+    size_t partitioned_count = 0u;
+    size_t critical_count = 0u;
+    size_t count = list_entries(root, NULL, names);
+    size_t index;
+    memset(volumes, 0, sizeof(*volumes));
+    for (index = 0u; index < count; ++index) {
+        char base[MAX_NAME + 1];
+        char path[PATH_MAX];
+        char major_minor[32];
+        if (!storage_valid_name(names[index]) ||
+            !storage_base_name(names[index], base, sizeof(base))) {
+            continue;
+        }
+        if (storage_is_partition(root, names[index]) && partitioned_count < MAX_ENTRIES &&
+            !storage_list_contains(partitioned, partitioned_count, base)) {
+            (void)snprintf(partitioned[partitioned_count++], MAX_NAME + 1u, "%s", base);
+        }
+        if (critical_count < MAX_ENTRIES &&
+            join_path(path, sizeof(path), root, names[index], "dev") &&
+            read_text_file(path, major_minor, sizeof(major_minor)) &&
+            storage_critical_mount(major_minor) &&
+            !storage_list_contains(critical, critical_count, base)) {
+            (void)snprintf(critical[critical_count++], MAX_NAME + 1u, "%s", base);
+        }
+    }
+    for (index = 0u; index < count && volumes->count < MAX_STORAGE_VOLUMES; ++index) {
+        char base[MAX_NAME + 1];
+        char path[PATH_MAX];
+        char major_minor[32];
+        char transport[16];
+        char source[STORAGE_PATH_CAPACITY];
+        char size_path[PATH_MAX];
+        char sector_path[PATH_MAX];
+        char ro_path[PATH_MAX];
+        int64_t sectors = 0;
+        int64_t sector_size = 512;
+        int64_t read_only = 0;
+        StorageVolume *volume;
+        int is_partition;
+        if (!storage_base_name(names[index], base, sizeof(base))) {
+            continue;
+        }
+        is_partition = storage_is_partition(root, names[index]);
+        if (!is_partition && storage_list_contains(partitioned, partitioned_count, base)) {
+            continue;
+        }
+        if (storage_list_contains(critical, critical_count, base) ||
+            !storage_parent_allowed(root, base, names[index], transport) ||
+            !join_path(path, sizeof(path), root, names[index], "dev") ||
+            !read_text_file(path, major_minor, sizeof(major_minor)) ||
+            strchr(major_minor, ':') == NULL || storage_critical_mount(major_minor) ||
+            snprintf(source, sizeof(source), "%s/%s", dev_root, names[index]) >= (int)sizeof(source) ||
+            !storage_source_usable(source)) {
+            continue;
+        }
+        volume = &volumes->items[volumes->count++];
+        memset(volume, 0, sizeof(*volume));
+        (void)snprintf(volume->id, sizeof(volume->id), "storage:%s", names[index]);
+        (void)snprintf(volume->name, sizeof(volume->name), "%s", names[index]);
+        (void)snprintf(volume->source, sizeof(volume->source), "%s", source);
+        (void)snprintf(volume->parent, sizeof(volume->parent), "%s", base);
+        (void)snprintf(volume->transport, sizeof(volume->transport), "%s", transport);
+        (void)snprintf(volume->major_minor, sizeof(volume->major_minor), "%s", major_minor);
+        storage_alias_for("MSYS_HAL_BY_LABEL_ROOT", "/dev/disk/by-label", source, volume->label, sizeof(volume->label));
+        storage_alias_for("MSYS_HAL_BY_UUID_ROOT", "/dev/disk/by-uuid", source, volume->uuid, sizeof(volume->uuid));
+        if (join_path(size_path, sizeof(size_path), root, names[index], "size")) {
+            (void)read_i64_file(size_path, 0, INT64_MAX, &sectors);
+        }
+        if (join_path(sector_path, sizeof(sector_path), root, names[index], "queue/logical_block_size")) {
+            (void)read_i64_file(sector_path, 1, INT32_MAX, &sector_size);
+        }
+        if (sectors > 0 && sector_size > 0 && (uint64_t)sectors <= UINT64_MAX / (uint64_t)sector_size) {
+            volume->size_bytes = (uint64_t)sectors * (uint64_t)sector_size;
+        }
+        if (join_path(ro_path, sizeof(ro_path), root, names[index], "ro")) {
+            (void)read_i64_file(ro_path, 0, 1, &read_only);
+        }
+        volume->read_only = read_only != 0;
+        volume->mounted = storage_mount_for(
+            major_minor,
+            volume->mount_point,
+            sizeof(volume->mount_point),
+            volume->filesystem,
+            sizeof(volume->filesystem)
+        );
+        if (volume->mounted) {
+            size_t root_length = strlen(mount_root);
+            volume->managed = strncmp(volume->mount_point, mount_root, root_length) == 0 &&
+                volume->mount_point[root_length] == '/';
+        }
+        {
+            char slug[MAX_NAME + 1];
+            storage_slug(names[index], names[index], slug);
+            (void)snprintf(
+                volume->preferred_mount_point,
+                sizeof(volume->preferred_mount_point),
+                "%s/%s",
+                mount_root,
+                slug
+            );
+        }
+        storage_apply_error(volume);
+    }
+}
+
+static StorageVolume *storage_find(StorageList *volumes, const char *identifier)
+{
+    size_t index;
+    if (strncmp(identifier, "storage:", 8u) != 0 || !storage_valid_name(identifier + 8u)) {
+        return NULL;
+    }
+    for (index = 0u; index < volumes->count; ++index) {
+        if (strcmp(volumes->items[index].id, identifier) == 0) {
+            return &volumes->items[index];
+        }
+    }
+    return NULL;
+}
+
+static int storage_run(char *const argv[])
+{
+    pid_t child = fork();
+    int status;
+    int attempts;
+    if (child == 0) {
+        int null_fd = open("/dev/null", O_RDWR | O_CLOEXEC);
+        if (null_fd >= 0) {
+            (void)dup2(null_fd, STDIN_FILENO);
+            (void)dup2(null_fd, STDOUT_FILENO);
+            (void)dup2(null_fd, STDERR_FILENO);
+            if (null_fd > STDERR_FILENO) {
+                (void)close(null_fd);
+            }
+        }
+        execv(argv[0], argv);
+        _exit(127);
+    }
+    if (child < 0) {
+        return -1;
+    }
+    for (attempts = 0; attempts < 150; ++attempts) {
+        pid_t observed = waitpid(child, &status, WNOHANG);
+        if (observed == child) {
+            return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        }
+        if (observed < 0 && errno != EINTR) {
+            return -1;
+        }
+        {
+            struct timespec delay = {0, 100000000L};
+            (void)nanosleep(&delay, NULL);
+        }
+    }
+    (void)kill(child, SIGKILL);
+    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
+    }
+    return 124;
+}
+
+static const char *storage_binary(const char *environment, const char *first, const char *second)
+{
+    const char *configured = getenv(environment);
+    if (configured != NULL && configured[0] == '/' && strlen(configured) < PATH_MAX) {
+        return configured;
+    }
+    return access(first, X_OK) == 0 ? first : second;
+}
+
+static int storage_prepare_target(StorageVolume *volume)
+{
+    const char *root = storage_mount_root();
+    struct stat status;
+    if (lstat(root, &status) != 0) {
+        if (errno != ENOENT || mkdir(root, 0755) != 0) {
+            return 0;
+        }
+    } else if (!S_ISDIR(status.st_mode) || S_ISLNK(status.st_mode)) {
+        return 0;
+    }
+    if (lstat(volume->preferred_mount_point, &status) != 0) {
+        if (errno != ENOENT || mkdir(volume->preferred_mount_point, 0755) != 0) {
+            return 0;
+        }
+    } else if (!S_ISDIR(status.st_mode) || S_ISLNK(status.st_mode)) {
+        return 0;
+    }
+    return 1;
+}
+
+static int storage_mount_volume(StorageVolume *volume, int read_only)
+{
+    const char *binary;
+    char options[48] = "nosuid,nodev,noexec";
+    char *arguments[6];
+    int result;
+    if (volume->mounted) {
+        return 1;
+    }
+    if (!storage_source_usable(volume->source) || !storage_prepare_target(volume)) {
+        storage_set_error(volume->name, "HAL_STORAGE_MOUNT_FAILED", "mount-path-unavailable");
+        return -1;
+    }
+    if (read_only || volume->read_only) {
+        (void)strncat(options, ",ro", sizeof(options) - strlen(options) - 1u);
+    }
+    binary = storage_binary("MSYS_HAL_MOUNT_BINARY", "/bin/mount", "/usr/bin/mount");
+    arguments[0] = (char *)binary;
+    arguments[1] = "-o";
+    arguments[2] = options;
+    arguments[3] = volume->source;
+    arguments[4] = volume->preferred_mount_point;
+    arguments[5] = NULL;
+    result = storage_run(arguments);
+    if (result != 0) {
+        char reason[64];
+        (void)snprintf(reason, sizeof(reason), "mount-returncode:%d", result);
+        storage_set_error(volume->name, "HAL_STORAGE_MOUNT_FAILED", reason);
+        return -1;
+    }
+    storage_clear_error(volume->name);
+    return 1;
+}
+
+static int storage_unmount_volume(StorageVolume *volume)
+{
+    const char *binary;
+    char *arguments[3];
+    int result;
+    if (!volume->mounted) {
+        return 1;
+    }
+    if (!volume->managed || volume->mount_point[0] != '/') {
+        return -2;
+    }
+    binary = storage_binary("MSYS_HAL_UMOUNT_BINARY", "/bin/umount", "/usr/bin/umount");
+    arguments[0] = (char *)binary;
+    arguments[1] = volume->mount_point;
+    arguments[2] = NULL;
+    result = storage_run(arguments);
+    if (result != 0) {
+        char reason[64];
+        (void)snprintf(reason, sizeof(reason), "umount-returncode:%d", result);
+        storage_set_error(volume->name, "HAL_STORAGE_UNMOUNT_FAILED", reason);
+        return -1;
+    }
+    storage_clear_error(volume->name);
+    storage_list_add(storage_suppressed, &storage_suppressed_count, volume->name);
+    return 1;
+}
+
+static void storage_config_path(char output[PATH_MAX])
+{
+    const char *configured = getenv("MSYS_HAL_STORAGE_CONFIG");
+    const char *state = root_path("MSYS_STATE_DIR", "/var/lib/msys/hal");
+    if (configured != NULL && configured[0] == '/') {
+        (void)snprintf(output, PATH_MAX, "%s", configured);
+    } else {
+        (void)snprintf(output, PATH_MAX, "%s/storage.json", state);
+    }
+}
+
+static void storage_load_config(void)
+{
+    char path[PATH_MAX];
+    char value[1024];
+    const char *environment;
+    if (storage_config_loaded) {
+        return;
+    }
+    storage_config_loaded = 1;
+    environment = getenv("MSYS_HAL_STORAGE_AUTOMOUNT");
+    if (environment != NULL) {
+        storage_auto_mount = strcmp(environment, "0") != 0 && strcmp(environment, "false") != 0;
+    }
+    storage_config_path(path);
+    if (!read_text_file(path, value, sizeof(value))) {
+        return;
+    }
+    if (strstr(value, "\"auto_mount\":true") != NULL) {
+        storage_auto_mount = 1;
+    } else if (strstr(value, "\"auto_mount\":false") != NULL) {
+        storage_auto_mount = 0;
+    } else {
+        (void)snprintf(storage_config_error, sizeof(storage_config_error), "config-invalid");
+    }
+}
+
+static int storage_save_config(int auto_mount)
+{
+    char path[PATH_MAX];
+    char temporary[PATH_MAX];
+    char directory[PATH_MAX];
+    char *separator;
+    int descriptor;
+    char content[128];
+    int length;
+    storage_config_path(path);
+    (void)snprintf(directory, sizeof(directory), "%s", path);
+    separator = strrchr(directory, '/');
+    if (separator == NULL || separator == directory) {
+        return 0;
+    }
+    *separator = '\0';
+    if (mkdir(directory, 0700) != 0 && errno != EEXIST) {
+        return 0;
+    }
+    if (snprintf(temporary, sizeof(temporary), "%s.%ld.tmp", path, (long)getpid()) >= (int)sizeof(temporary)) {
+        return 0;
+    }
+    descriptor = open(temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (descriptor < 0) {
+        return 0;
+    }
+    length = snprintf(
+        content,
+        sizeof(content),
+        "{\"schema\":\"msys.hal.storage.config.v1\",\"auto_mount\":%s}\n",
+        auto_mount ? "true" : "false"
+    );
+    if (length <= 0 || write(descriptor, content, (size_t)length) != length ||
+        fsync(descriptor) != 0 || close(descriptor) != 0 || rename(temporary, path) != 0) {
+        (void)close(descriptor);
+        (void)unlink(temporary);
+        return 0;
+    }
+    return 1;
+}
+
+static int storage_same(const StorageList *left, const StorageList *right)
+{
+    return left->count == right->count &&
+           memcmp(left->items, right->items, left->count * sizeof(left->items[0])) == 0;
+}
+
+static int storage_refresh(int apply_auto_mount)
+{
+    StorageList next;
+    size_t index;
+    int changed;
+    storage_load_config();
+    storage_scan(&next);
+    if (apply_auto_mount && storage_auto_mount) {
+        for (index = 0u; index < next.count; ++index) {
+            StorageVolume *volume = &next.items[index];
+            if (!volume->mounted &&
+                !storage_list_contains(storage_attempted, storage_attempted_count, volume->name) &&
+                !storage_list_contains(storage_suppressed, storage_suppressed_count, volume->name)) {
+                storage_list_add(storage_attempted, &storage_attempted_count, volume->name);
+                (void)storage_mount_volume(volume, volume->read_only);
+            }
+        }
+        storage_scan(&next);
+    }
+    for (index = 0u; index < storage_suppressed_count;) {
+        size_t found;
+        for (found = 0u; found < next.count; ++found) {
+            if (strcmp(storage_suppressed[index], next.items[found].name) == 0) {
+                break;
+            }
+        }
+        if (found == next.count) {
+            storage_list_remove(storage_suppressed, &storage_suppressed_count, storage_suppressed[index]);
+        } else {
+            ++index;
+        }
+    }
+    for (index = 0u; index < storage_attempted_count;) {
+        size_t found;
+        for (found = 0u; found < next.count; ++found) {
+            if (strcmp(storage_attempted[index], next.items[found].name) == 0) {
+                break;
+            }
+        }
+        if (found == next.count) {
+            storage_list_remove(storage_attempted, &storage_attempted_count, storage_attempted[index]);
+        } else {
+            ++index;
+        }
+    }
+    changed = !storage_same(&storage_cache, &next);
+    storage_cache = next;
+    if (changed) {
+        ++storage_revision;
+        ++revision_number;
+    }
+    return changed;
 }
 
 static void add_device(
@@ -3596,9 +4434,276 @@ static int build_describe(
         "\"network.state.read\",\"network.rfkill.write\",\"network.wifi.scan\","
         "\"network.wifi.connect\",\"network.wifi.disconnect\",\"network.wifi.forget\","
         "\"bluetooth.state.read\",\"bluetooth.rfkill.write\",\"bluetooth.discovery.scan\","
-        "\"bluetooth.pairing.unavailable\"]}"
+        "\"bluetooth.pairing.unavailable\",\"storage.volume.inventory\","
+        "\"storage.volume.mount\",\"storage.volume.unmount\","
+        "\"storage.automount.configure\"]}"
     );
     return !buffer->failed;
+}
+
+static void append_storage_volume(JsonBuffer *buffer, const StorageVolume *volume)
+{
+    buffer_append(buffer, "{\"id\":");
+    buffer_string(buffer, volume->id);
+    buffer_append(buffer, ",\"name\":");
+    buffer_string(buffer, volume->name);
+    buffer_append(buffer, ",\"source\":");
+    buffer_string(buffer, volume->source);
+    buffer_append(buffer, ",\"parent\":");
+    buffer_string(buffer, volume->parent);
+    buffer_append(buffer, ",\"transport\":");
+    buffer_string(buffer, volume->transport);
+    buffer_append(buffer, ",\"label\":");
+    if (volume->label[0] != '\0') {
+        buffer_string(buffer, volume->label);
+    } else {
+        buffer_append(buffer, "null");
+    }
+    buffer_append(buffer, ",\"uuid\":");
+    if (volume->uuid[0] != '\0') {
+        buffer_string(buffer, volume->uuid);
+    } else {
+        buffer_append(buffer, "null");
+    }
+    buffer_format(
+        buffer,
+        ",\"size_bytes\":%" PRIu64 ",\"read_only\":%s,\"mounted\":%s",
+        volume->size_bytes,
+        volume->read_only ? "true" : "false",
+        volume->mounted ? "true" : "false"
+    );
+    buffer_append(buffer, ",\"mount_point\":");
+    if (volume->mounted && volume->mount_point[0] != '\0') {
+        buffer_string(buffer, volume->mount_point);
+    } else {
+        buffer_append(buffer, "null");
+    }
+    buffer_append(buffer, ",\"preferred_mount_point\":");
+    buffer_string(buffer, volume->preferred_mount_point);
+    buffer_format(buffer, ",\"managed\":%s,\"filesystem\":", volume->managed ? "true" : "false");
+    if (volume->filesystem[0] != '\0') {
+        buffer_string(buffer, volume->filesystem);
+    } else {
+        buffer_append(buffer, "null");
+    }
+    if (volume->error_code[0] != '\0') {
+        buffer_append(buffer, ",\"error\":{\"code\":");
+        buffer_string(buffer, volume->error_code);
+        buffer_append(buffer, ",\"reason\":");
+        buffer_string(buffer, volume->error_reason);
+        buffer_append(buffer, "}");
+    }
+    buffer_append(buffer, "}");
+}
+
+static int append_storage_snapshot(JsonBuffer *buffer)
+{
+    const char *mount_root = storage_mount_root();
+    size_t index;
+    buffer_format(
+        buffer,
+        "{\"schema\":\"%s\",\"version\":\"%s\",\"revision\":%" PRIu64
+        ",\"auto_mount\":%s,\"mount_root\":",
+        STORAGE_INTERFACE,
+        HAL_VERSION,
+        storage_revision,
+        storage_auto_mount ? "true" : "false"
+    );
+    buffer_string(buffer, mount_root);
+    buffer_append(buffer, ",\"config_error\":");
+    if (storage_config_error[0] != '\0') {
+        buffer_string(buffer, storage_config_error);
+    } else {
+        buffer_append(buffer, "null");
+    }
+    buffer_append(buffer, ",\"volumes\":[");
+    for (index = 0u; index < storage_cache.count; ++index) {
+        if (index != 0u) {
+            buffer_append(buffer, ",");
+        }
+        append_storage_volume(buffer, &storage_cache.items[index]);
+    }
+    buffer_append(buffer, "]}");
+    return !buffer->failed;
+}
+
+static int build_storage_list(
+    const char *json,
+    const JsonToken *tokens,
+    int count,
+    JsonBuffer *buffer,
+    int force_refresh
+)
+{
+    static const char *const list_allowed[] = {"refresh"};
+    int refresh = -1;
+    int boolean_value = 0;
+    if (!object_validate_fields(
+            json,
+            tokens,
+            count,
+            0,
+            force_refresh != 0 ? NULL : list_allowed,
+            force_refresh != 0 ? 0u : 1u)) {
+        return 0;
+    }
+    if (force_refresh == 0) {
+        refresh = object_field(json, tokens, count, 0, "refresh");
+        if (refresh == -2 || (refresh >= 0 && !token_bool(json, &tokens[refresh], &boolean_value))) {
+            return 0;
+        }
+    }
+    if (force_refresh == 1 || boolean_value) {
+        (void)storage_refresh(1);
+    }
+    return append_storage_snapshot(buffer) ? 1 : -2;
+}
+
+static int storage_request_id(
+    const char *json,
+    const JsonToken *tokens,
+    int count,
+    const char *const *allowed,
+    size_t allowed_count,
+    char identifier[MAX_NAME + 10]
+)
+{
+    int field;
+    if (!object_validate_fields(json, tokens, count, 0, allowed, allowed_count)) {
+        return 0;
+    }
+    field = object_field(json, tokens, count, 0, "volume_id");
+    return field >= 0 &&
+           copy_string(json, &tokens[field], identifier, MAX_NAME + 10u) &&
+           strncmp(identifier, "storage:", 8u) == 0 &&
+           storage_valid_name(identifier + 8u);
+}
+
+static int build_storage_mount(
+    const char *json,
+    const JsonToken *tokens,
+    int count,
+    JsonBuffer *buffer
+)
+{
+    static const char *const allowed[] = {"volume_id", "read_only"};
+    char identifier[MAX_NAME + 10];
+    int read_only_field;
+    int read_only = 0;
+    StorageVolume *volume;
+    if (!storage_request_id(json, tokens, count, allowed, 2u, identifier)) {
+        return 0;
+    }
+    read_only_field = object_field(json, tokens, count, 0, "read_only");
+    if (read_only_field == -2 ||
+        (read_only_field >= 0 && !token_bool(json, &tokens[read_only_field], &read_only))) {
+        return 0;
+    }
+    (void)storage_refresh(0);
+    volume = storage_find(&storage_cache, identifier);
+    if (volume == NULL) {
+        return -1;
+    }
+    if (storage_mount_volume(volume, read_only) < 0) {
+        (void)storage_refresh(0);
+        return -4;
+    }
+    storage_list_remove(storage_suppressed, &storage_suppressed_count, volume->name);
+    (void)storage_refresh(0);
+    volume = storage_find(&storage_cache, identifier);
+    if (volume == NULL || !volume->mounted) {
+        storage_set_error(identifier + 8u, "HAL_STORAGE_MOUNT_FAILED", "mount-not-observed");
+        (void)storage_refresh(0);
+        return -4;
+    }
+    buffer_format(
+        buffer,
+        "{\"schema\":\"%s\",\"revision\":%" PRIu64 ",\"volume\":",
+        STORAGE_INTERFACE,
+        storage_revision
+    );
+    append_storage_volume(buffer, volume);
+    buffer_append(buffer, "}");
+    return buffer->failed ? -2 : 1;
+}
+
+static int build_storage_unmount(
+    const char *json,
+    const JsonToken *tokens,
+    int count,
+    JsonBuffer *buffer
+)
+{
+    static const char *const allowed[] = {"volume_id"};
+    char identifier[MAX_NAME + 10];
+    StorageVolume *volume;
+    int result;
+    if (!storage_request_id(json, tokens, count, allowed, 1u, identifier)) {
+        return 0;
+    }
+    (void)storage_refresh(0);
+    volume = storage_find(&storage_cache, identifier);
+    if (volume == NULL) {
+        return -1;
+    }
+    result = storage_unmount_volume(volume);
+    if (result == -2) {
+        return -6;
+    }
+    if (result < 0) {
+        (void)storage_refresh(0);
+        return -5;
+    }
+    (void)storage_refresh(0);
+    volume = storage_find(&storage_cache, identifier);
+    if (volume == NULL || volume->mounted) {
+        return -5;
+    }
+    buffer_format(
+        buffer,
+        "{\"schema\":\"%s\",\"revision\":%" PRIu64 ",\"volume\":",
+        STORAGE_INTERFACE,
+        storage_revision
+    );
+    append_storage_volume(buffer, volume);
+    buffer_append(buffer, "}");
+    return buffer->failed ? -2 : 1;
+}
+
+static int build_storage_config(
+    const char *json,
+    const JsonToken *tokens,
+    int count,
+    JsonBuffer *buffer
+)
+{
+    static const char *const allowed[] = {"auto_mount"};
+    int field;
+    int enabled;
+    int changed;
+    if (!object_validate_fields(json, tokens, count, 0, allowed, 1u) ||
+        (field = object_field(json, tokens, count, 0, "auto_mount")) < 0 ||
+        !token_bool(json, &tokens[field], &enabled)) {
+        return 0;
+    }
+    if (!storage_save_config(enabled)) {
+        (void)snprintf(storage_config_error, sizeof(storage_config_error), "config-write-failed");
+        return -7;
+    }
+    changed = storage_auto_mount != enabled || storage_config_error[0] != '\0';
+    if (enabled && storage_auto_mount != enabled) {
+        storage_attempted_count = 0u;
+    }
+    storage_auto_mount = enabled;
+    storage_config_error[0] = '\0';
+    if (changed) {
+        ++storage_revision;
+        ++revision_number;
+    }
+    if (enabled) {
+        (void)storage_refresh(1);
+    }
+    return append_storage_snapshot(buffer) ? 1 : -2;
 }
 
 typedef enum {
@@ -3607,7 +4712,11 @@ typedef enum {
     DISPATCH_UNAVAILABLE,
     DISPATCH_READ_ONLY,
     DISPATCH_INTERNAL,
-    DISPATCH_UNSUPPORTED
+    DISPATCH_UNSUPPORTED,
+    DISPATCH_STORAGE_MOUNT_FAILED,
+    DISPATCH_STORAGE_UNMOUNT_FAILED,
+    DISPATCH_STORAGE_NOT_MANAGED,
+    DISPATCH_PERSISTENCE
 } DispatchResult;
 
 static DispatchResult dispatch(
@@ -3629,9 +4738,21 @@ static DispatchResult dispatch(
     } else if (strcmp(method, "inventory") == 0) {
         result = build_inventory(payload, tokens, count, response, &ignored_count);
     } else if (strcmp(method, "get_state") == 0) {
-        result = build_get_state(payload, tokens, count, response);
+        result = object_field(payload, tokens, count, 0, "id") == -1
+            ? build_storage_list(payload, tokens, count, response, 2)
+            : build_get_state(payload, tokens, count, response);
     } else if (strcmp(method, "set_state") == 0) {
         result = build_set_state(payload, tokens, count, response);
+    } else if (strcmp(method, "list_volumes") == 0) {
+        result = build_storage_list(payload, tokens, count, response, 0);
+    } else if (strcmp(method, "refresh") == 0) {
+        result = build_storage_list(payload, tokens, count, response, 1);
+    } else if (strcmp(method, "mount") == 0) {
+        result = build_storage_mount(payload, tokens, count, response);
+    } else if (strcmp(method, "unmount") == 0) {
+        result = build_storage_unmount(payload, tokens, count, response);
+    } else if (strcmp(method, "set_config") == 0) {
+        result = build_storage_config(payload, tokens, count, response);
     } else if (strcmp(method, "list_providers") == 0) {
         result = build_list_providers(payload, tokens, count, response);
     } else if (strcmp(method, "get_provider") == 0) {
@@ -3657,6 +4778,18 @@ static DispatchResult dispatch(
     if (result == -3) {
         return DISPATCH_READ_ONLY;
     }
+    if (result == -4) {
+        return DISPATCH_STORAGE_MOUNT_FAILED;
+    }
+    if (result == -5) {
+        return DISPATCH_STORAGE_UNMOUNT_FAILED;
+    }
+    if (result == -6) {
+        return DISPATCH_STORAGE_NOT_MANAGED;
+    }
+    if (result == -7) {
+        return DISPATCH_PERSISTENCE;
+    }
     return DISPATCH_INTERNAL;
 }
 
@@ -3667,6 +4800,10 @@ static const char *dispatch_code(DispatchResult result)
     case DISPATCH_UNAVAILABLE: return "HAL_UNAVAILABLE";
     case DISPATCH_READ_ONLY: return "HAL_READ_ONLY";
     case DISPATCH_UNSUPPORTED: return "HAL_UNSUPPORTED";
+    case DISPATCH_STORAGE_MOUNT_FAILED: return "HAL_STORAGE_MOUNT_FAILED";
+    case DISPATCH_STORAGE_UNMOUNT_FAILED: return "HAL_STORAGE_UNMOUNT_FAILED";
+    case DISPATCH_STORAGE_NOT_MANAGED: return "HAL_STORAGE_NOT_MANAGED";
+    case DISPATCH_PERSISTENCE: return "HAL_PERSISTENCE_ERROR";
     case DISPATCH_INTERNAL: return "HAL_INTERNAL_ERROR";
     case DISPATCH_OK: break;
     }
@@ -3680,10 +4817,27 @@ static const char *dispatch_message(DispatchResult result)
     case DISPATCH_UNAVAILABLE: return "HAL device is unavailable";
     case DISPATCH_READ_ONLY: return "HAL device is read-only";
     case DISPATCH_UNSUPPORTED: return "method is not supported by native HAL phase 1";
+    case DISPATCH_STORAGE_MOUNT_FAILED: return "storage volume could not be mounted";
+    case DISPATCH_STORAGE_UNMOUNT_FAILED: return "storage volume is busy or could not be unmounted";
+    case DISPATCH_STORAGE_NOT_MANAGED: return "storage volume is mounted outside the MSYS media root";
+    case DISPATCH_PERSISTENCE: return "storage configuration could not be saved";
     case DISPATCH_INTERNAL: return "native HAL operation failed";
     case DISPATCH_OK: break;
     }
     return "native HAL operation failed";
+}
+
+static void send_storage_changed(msys_mipc_client *client)
+{
+    char payload[128];
+    (void)snprintf(
+        payload,
+        sizeof(payload),
+        "{\"revision\":%" PRIu64 ",\"volumes\":%zu}",
+        storage_revision,
+        storage_cache.count
+    );
+    (void)msys_mipc_send_event_json(client, "msys.hal.storage.changed", payload);
 }
 
 static int process_call(msys_mipc_client *client, const char *packet)
@@ -3695,6 +4849,7 @@ static int process_call(msys_mipc_client *client, const char *packet)
     JsonBuffer response;
     DispatchResult dispatched;
     int result;
+    uint64_t storage_before = storage_revision;
     if (msys_mipc_json_get_u64(packet, "id", &request_id) != MSYS_MIPC_OK ||
         msys_mipc_json_get_string(packet, "method", method, sizeof(method), NULL) != MSYS_MIPC_OK ||
         msys_mipc_json_get_raw(packet, "payload", &payload, &payload_length) != MSYS_MIPC_OK ||
@@ -3759,6 +4914,9 @@ static int process_call(msys_mipc_client *client, const char *packet)
             dispatch_code(dispatched),
             dispatch_message(dispatched)
         );
+    }
+    if (result == MSYS_MIPC_OK && storage_revision != storage_before) {
+        send_storage_changed(client);
     }
     buffer_free(&response);
     return result;
@@ -3839,11 +4997,59 @@ static int self_check(void)
     return 0;
 }
 
+static int storage_open_uevent(void)
+{
+    struct sockaddr_nl address;
+    int descriptor = socket(AF_NETLINK, SOCK_DGRAM | SOCK_CLOEXEC, NETLINK_KOBJECT_UEVENT);
+    if (descriptor < 0) {
+        return -1;
+    }
+    memset(&address, 0, sizeof(address));
+    address.nl_family = AF_NETLINK;
+    address.nl_pid = (uint32_t)getpid();
+    address.nl_groups = 1u;
+    if (bind(descriptor, (struct sockaddr *)&address, sizeof(address)) != 0) {
+        (void)close(descriptor);
+        return -1;
+    }
+    (void)fcntl(descriptor, F_SETFL, fcntl(descriptor, F_GETFL, 0) | O_NONBLOCK);
+    return descriptor;
+}
+
+static int storage_uevent_is_block(const char *packet, size_t length, char name[MAX_NAME + 1])
+{
+    size_t position = 0u;
+    int block = 0;
+    int action = 0;
+    name[0] = '\0';
+    while (position < length) {
+        const char *field = packet + position;
+        size_t available = length - position;
+        size_t field_length = strnlen(field, available);
+        if (field_length == available) {
+            break;
+        }
+        if (strcmp(field, "SUBSYSTEM=block") == 0) {
+            block = 1;
+        } else if (strcmp(field, "ACTION=add") == 0 ||
+                   strcmp(field, "ACTION=remove") == 0 ||
+                   strcmp(field, "ACTION=change") == 0) {
+            action = 1;
+        } else if (strncmp(field, "DEVNAME=", 8u) == 0 &&
+                   storage_valid_name(field + 8u)) {
+            (void)snprintf(name, MAX_NAME + 1u, "%s", field + 8u);
+        }
+        position += field_length + 1u;
+    }
+    return block && action;
+}
+
 static int run_component(void)
 {
     msys_mipc_client client;
     char *packet;
     int result;
+    int uevent = -1;
     result = msys_mipc_client_from_env(&client);
     if (result != MSYS_MIPC_OK) {
         fprintf(stderr, "msys-hal-native: invalid MSYS_CONTROL_FD\n");
@@ -3870,13 +5076,74 @@ static int run_component(void)
         free(packet);
         return 1;
     }
+    uevent = storage_open_uevent();
+    if (storage_refresh(1)) {
+        send_storage_changed(&client);
+    }
     for (;;) {
         char type[32];
+        struct pollfd descriptors[2];
+        nfds_t descriptor_count = 1u;
+        int timeout = -1;
+        int ready;
+        descriptors[0].fd = msys_mipc_client_fd(&client);
+        descriptors[0].events = POLLIN;
+        descriptors[0].revents = 0;
+        if (uevent >= 0) {
+            descriptors[1].fd = uevent;
+            descriptors[1].events = POLLIN;
+            descriptors[1].revents = 0;
+            descriptor_count = 2u;
+        } else {
+            int fallback = 30;
+            const char *configured = getenv("MSYS_HAL_STORAGE_FALLBACK_SECONDS");
+            if (configured != NULL) {
+                (void)parse_decimal(configured, 10, 300, &fallback);
+            }
+            timeout = fallback * 1000;
+        }
+        do {
+            ready = poll(descriptors, descriptor_count, timeout);
+        } while (ready < 0 && errno == EINTR);
+        if (ready < 0) {
+            if (uevent >= 0) {
+                (void)close(uevent);
+            }
+            free(packet);
+            return 1;
+        }
+        if (ready == 0) {
+            if (storage_refresh(1)) {
+                send_storage_changed(&client);
+            }
+            continue;
+        }
+        if (uevent >= 0 && (descriptors[1].revents & POLLIN) != 0) {
+            char event_packet[8192];
+            ssize_t received = recv(uevent, event_packet, sizeof(event_packet), 0);
+            if (received > 0) {
+                char name[MAX_NAME + 1];
+                if (storage_uevent_is_block(event_packet, (size_t)received, name)) {
+                    if (name[0] != '\0') {
+                        storage_list_remove(storage_attempted, &storage_attempted_count, name);
+                    }
+                    if (storage_refresh(1)) {
+                        send_storage_changed(&client);
+                    }
+                }
+            }
+        }
+        if ((descriptors[0].revents & (POLLHUP | POLLERR | POLLNVAL)) != 0) {
+            break;
+        }
+        if ((descriptors[0].revents & POLLIN) == 0) {
+            continue;
+        }
         result = msys_mipc_recv_json(
             &client,
             packet,
             MSYS_MIPC_RECV_CAPACITY,
-            -1,
+            0,
             NULL
         );
         if (result == MSYS_MIPC_EOF) {
@@ -3901,6 +5168,9 @@ static int run_component(void)
             free(packet);
             return 1;
         }
+    }
+    if (uevent >= 0) {
+        (void)close(uevent);
     }
     free(packet);
     msys_mipc_client_close(&client);

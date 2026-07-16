@@ -183,6 +183,43 @@ class NativeHalProtocolTests(unittest.TestCase):
         self.wpa = FakeWpaControl(self.roots["MSYS_HAL_WPA_ROOT"])
         self.addCleanup(self.wpa.close)
 
+        storage_block = root / "block"
+        storage_dev = root / "dev"
+        storage_mount = root / "media" / "msys"
+        storage_mountinfo = root / "mountinfo"
+        storage_labels = storage_dev / "disk" / "by-label"
+        storage_uuids = storage_dev / "disk" / "by-uuid"
+        for path in (storage_block, storage_dev, storage_labels, storage_uuids):
+            path.mkdir(parents=True, exist_ok=True)
+        storage_mount.parent.mkdir(parents=True, exist_ok=True)
+        disk = storage_block / "sda"
+        partition = storage_block / "sda1"
+        disk.mkdir()
+        partition.mkdir()
+        _write(disk / "dev", "8:0\n")
+        _write(disk / "removable", "1\n")
+        _write(partition / "dev", "8:1\n")
+        _write(partition / "partition", "1\n")
+        _write(partition / "size", "4096\n")
+        _write(partition / "queue" / "logical_block_size", "512\n")
+        _write(partition / "ro", "0\n")
+        (storage_dev / "sda").write_bytes(b"")
+        (storage_dev / "sda1").write_bytes(b"")
+        storage_mountinfo.write_text("", encoding="ascii")
+        fake_mount = root / "fake-mount"
+        fake_umount = root / "fake-umount"
+        fake_mount.write_text(
+            "#!/bin/sh\n"
+            "printf '36 25 8:1 / %s rw,nosuid,nodev,noexec - vfat %s rw\\n' \"$4\" \"$3\" > \"$MSYS_HAL_MOUNTINFO\"\n",
+            encoding="ascii",
+        )
+        fake_umount.write_text(
+            "#!/bin/sh\n: > \"$MSYS_HAL_MOUNTINFO\"\n",
+            encoding="ascii",
+        )
+        fake_mount.chmod(0o755)
+        fake_umount.chmod(0o755)
+
         supervisor, component = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         self.supervisor = supervisor
         environment = dict(os.environ)
@@ -191,6 +228,17 @@ class NativeHalProtocolTests(unittest.TestCase):
             "MSYS_CONTROL_FD": str(component.fileno()),
             "MSYS_COMPONENT_ID": "org.msys.hal.linux:native-manager",
             "MSYS_GENERATION": "7",
+            "MSYS_HAL_BLOCK_ROOT": str(storage_block),
+            "MSYS_HAL_DEV_ROOT": str(storage_dev),
+            "MSYS_HAL_MOUNTINFO": str(storage_mountinfo),
+            "MSYS_HAL_STORAGE_MOUNT_ROOT": str(storage_mount),
+            "MSYS_HAL_BY_LABEL_ROOT": str(storage_labels),
+            "MSYS_HAL_BY_UUID_ROOT": str(storage_uuids),
+            "MSYS_HAL_MOUNT_BINARY": str(fake_mount),
+            "MSYS_HAL_UMOUNT_BINARY": str(fake_umount),
+            "MSYS_HAL_STORAGE_CONFIG": str(root / "storage.json"),
+            "MSYS_HAL_STORAGE_AUTOMOUNT": "0",
+            "MSYS_HAL_STORAGE_TEST": "1",
         })
         self.process = subprocess.Popen(
             [str(self.binary)],
@@ -261,7 +309,7 @@ class NativeHalProtocolTests(unittest.TestCase):
         described = self._call("describe", {})
         self.assertEqual(described["type"], "return")
         self.assertEqual(described["payload"]["schema"], "org.msys.hal.native-manager.v1")
-        self.assertEqual(described["payload"]["provider"]["version"], "0.2.16")
+        self.assertEqual(described["payload"]["provider"]["version"], "0.2.17")
 
         first = self._call("inventory", {})["payload"]
         second = self._call("inventory", {})["payload"]
@@ -411,6 +459,30 @@ class NativeHalProtocolTests(unittest.TestCase):
         unsupported = self._call("pair_bluetooth", {})
         self.assertEqual(unsupported["code"], "HAL_UNSUPPORTED")
 
+    def test_native_storage_role_lists_mounts_unmounts_and_persists_policy(self) -> None:
+        listed = self._call("list_volumes", {})
+        self.assertEqual(listed["type"], "return")
+        state = listed["payload"]
+        self.assertEqual(state["schema"], "org.msys.hal.storage.v1")
+        self.assertFalse(state["auto_mount"])
+        self.assertEqual([item["id"] for item in state["volumes"]], ["storage:sda1"])
+        self.assertEqual(state["volumes"][0]["size_bytes"], 4096 * 512)
+
+        mounted = self._call("mount", {"volume_id": "storage:sda1"})
+        self.assertEqual(mounted["type"], "return")
+        self.assertTrue(mounted["payload"]["volume"]["mounted"])
+        self.assertTrue(mounted["payload"]["volume"]["managed"])
+
+        unmounted = self._call("unmount", {"volume_id": "storage:sda1"})
+        self.assertEqual(unmounted["type"], "return")
+        self.assertFalse(unmounted["payload"]["volume"]["mounted"])
+
+        configured = self._call("set_config", {"auto_mount": False})
+        self.assertEqual(configured["type"], "return")
+        self.assertFalse(configured["payload"]["auto_mount"])
+        wrong_field = self._call("mount", {"id": "storage:sda1"})
+        self.assertEqual(wrong_field["code"], "HAL_BAD_PAYLOAD")
+
     def test_self_check_reports_version_and_rss(self) -> None:
         environment = dict(os.environ)
         environment.update({name: str(path) for name, path in self.roots.items()})
@@ -424,7 +496,7 @@ class NativeHalProtocolTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         report = json.loads(completed.stdout)
-        self.assertEqual(report["version"], "0.2.16")
+        self.assertEqual(report["version"], "0.2.17")
         self.assertTrue(report["ok"])
         self.assertTrue(report["wifi_control"])
         self.assertGreaterEqual(report["devices"], 8)

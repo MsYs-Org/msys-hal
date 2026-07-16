@@ -1,0 +1,21 @@
+{
+  "$schema": "https://msys.local/schemas/i18n-catalog.v1.json",
+  "schema": "msys.i18n.catalog.v1",
+  "id": "org.msys.hal.linux",
+  "description": "User-visible metadata for the MSYS Linux HAL",
+  "default_locale": "en-US",
+  "messages": {
+    "en-US": {
+      "package.name": "MSYS Linux HAL",
+      "package.summary": "Hardware, radio, display and removable-storage providers",
+      "storage.name": "Removable storage",
+      "storage.summary": "TF card, SD card and USB storage"
+    },
+    "zh-CN": {
+      "package.name": "MSYS Linux 硬件抽象层",
+      "package.summary": "硬件、无线、显示与可移动存储提供者",
+      "storage.name": "可移动存储",
+      "storage.summary": "TF 卡、SD 卡与 USB 存储设备"
+    }
+  }
+}

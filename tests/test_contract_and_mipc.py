@@ -28,7 +28,7 @@ class ContractAndMipcTests(unittest.TestCase):
         self.assertEqual(canonical, development)
         manifest = canonical
         self.assertEqual(manifest["schema"], "msys.manifest.v1")
-        self.assertEqual(__version__, "0.2.16")
+        self.assertEqual(__version__, "0.2.17")
         self.assertEqual(manifest["package"]["version"], __version__)
         pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
         project_version = re.search(
@@ -55,6 +55,14 @@ class ContractAndMipcTests(unittest.TestCase):
             native_role["x-msys-contract"],
             {"id": "org.msys.role.hal-manager.v1", "version": "1.0.0"},
         )
+        self.assertTrue(any(
+            provided.get("role") == "storage"
+            for provided in native["provides"]
+        ))
+        self.assertTrue(any(
+            provided.get("interface") == "org.msys.hal.storage.v1"
+            for provided in native["provides"]
+        ))
         self.assertEqual(manager["lifecycle"], "on-demand")
         self.assertEqual(manager["idle_timeout_ms"], 30000)
         hal_role = next(

@@ -10,9 +10,21 @@ The manager owns the exclusive `hal-manager` role and declares the stable
 contract's required `org.msys.hal.manager.v1` interface. Independent on-demand
 providers supply `org.msys.hal.provider.v1` for power, thermal, backlight,
 display layout/session state, input inventory/transforms, Linux network/Wi-Fi
-status and Bluetooth radio status. A board-specific native provider is an
+status and Bluetooth radio status. The native manager also supplies the
+separate `storage` role. A board-specific native provider is an
 ordinary language-neutral MSYS package and may outrank or be selected instead
 of one reference domain.
+
+Version 0.2.17 adds the `storage` role and
+`org.msys.hal.storage.v1` directly to the existing small C HAL process; it does
+not keep another Python runtime resident. It discovers removable TF/SD/USB
+block devices from
+`/sys/class/block`, reads current mounts from `/proc/self/mountinfo`, and can
+mount them below `/media/msys`. It listens to kernel block uevents instead of
+continuously polling; a 30-second fallback is used only when netlink is not
+available. Mounting uses the target's existing `mount`/`umount` commands with
+fixed `nosuid,nodev,noexec` options and no shell, udev, udisks, D-Bus, systemd
+or package-manager dependency. See [docs/storage-hal.md](docs/storage-hal.md).
 
 Version 0.2.13 extends the optional CH347 control contract with a persistent
 touch-cursor switch. The value is reported as applied only when the active
@@ -118,8 +130,8 @@ python3 -m tools.contract_tool manifest /path/to/msys-hal/manifest.json
 python3 -m tools.contract_tool manifest /path/to/msys-hal/manifests/msys-hal.json
 ```
 
-The manifest starts only the manager eagerly. Provider discovery wakes the
-small per-domain processes through the normal mIPC interface activation path.
+The manifest starts only the native manager eagerly. Provider discovery wakes the
+small per-domain Python fallback processes through the normal mIPC interface activation path.
 Settings and applications call:
 
 ```text
@@ -131,6 +143,18 @@ interface:org.msys.hal.manager.v1.get_provider
 interface:org.msys.hal.manager.v1.select_provider
 interface:org.msys.hal.manager.v1.reset_provider
 interface:org.msys.hal.manager.v1.watch
+```
+
+File managers and other applications should use the dedicated storage role so
+they do not need Linux paths or mount rules:
+
+```text
+role:storage.list_volumes
+role:storage.get_state
+role:storage.refresh
+role:storage.mount
+role:storage.unmount
+role:storage.set_config
 ```
 
 CH347 control is visible through those same calls as
