@@ -187,6 +187,7 @@ class NativeHalProtocolTests(unittest.TestCase):
         storage_dev = root / "dev"
         storage_mount = root / "media" / "msys"
         storage_mountinfo = root / "mountinfo"
+        self.storage_mountinfo = storage_mountinfo
         storage_labels = storage_dev / "disk" / "by-label"
         storage_uuids = storage_dev / "disk" / "by-uuid"
         for path in (storage_block, storage_dev, storage_labels, storage_uuids):
@@ -309,7 +310,7 @@ class NativeHalProtocolTests(unittest.TestCase):
         described = self._call("describe", {})
         self.assertEqual(described["type"], "return")
         self.assertEqual(described["payload"]["schema"], "org.msys.hal.native-manager.v1")
-        self.assertEqual(described["payload"]["provider"]["version"], "0.2.18")
+        self.assertEqual(described["payload"]["provider"]["version"], "0.2.19")
 
         first = self._call("inventory", {})["payload"]
         second = self._call("inventory", {})["payload"]
@@ -466,16 +467,57 @@ class NativeHalProtocolTests(unittest.TestCase):
         self.assertEqual(state["schema"], "org.msys.hal.storage.v1")
         self.assertFalse(state["auto_mount"])
         self.assertEqual([item["id"] for item in state["volumes"]], ["storage:sda1"])
-        self.assertEqual(state["volumes"][0]["size_bytes"], 4096 * 512)
+        initial = state["volumes"][0]
+        self.assertEqual(initial["size_bytes"], 4096 * 512)
+        for field in (
+            "total_bytes",
+            "available_bytes",
+            "free_bytes",
+            "used_bytes",
+            "usage_percent",
+        ):
+            self.assertIsNone(initial[field])
+
+        outside = Path(self.hardware.name) / "outside-mount"
+        outside.mkdir()
+        self.storage_mountinfo.write_text(
+            f"36 25 8:1 / {outside} rw,nosuid,nodev,noexec - vfat "
+            f"{Path(self.hardware.name) / 'dev' / 'sda1'} rw\n",
+            encoding="ascii",
+        )
+        external = self._call("list_volumes", {"refresh": True})["payload"]["volumes"][0]
+        self.assertTrue(external["mounted"])
+        self.assertFalse(external["managed"])
+        self.assertIsNone(external["total_bytes"])
+        self.assertIsNone(external["available_bytes"])
+        self.storage_mountinfo.write_text("", encoding="ascii")
 
         mounted = self._call("mount", {"volume_id": "storage:sda1"})
         self.assertEqual(mounted["type"], "return")
-        self.assertTrue(mounted["payload"]["volume"]["mounted"])
-        self.assertTrue(mounted["payload"]["volume"]["managed"])
+        volume = mounted["payload"]["volume"]
+        self.assertTrue(volume["mounted"])
+        self.assertTrue(volume["managed"])
+        self.assertGreater(volume["total_bytes"], 0)
+        self.assertGreaterEqual(volume["available_bytes"], 0)
+        self.assertEqual(volume["free_bytes"], volume["available_bytes"])
+        self.assertEqual(
+            volume["used_bytes"] + volume["available_bytes"],
+            volume["total_bytes"],
+        )
+        self.assertGreaterEqual(volume["usage_percent"], 0)
+        self.assertLessEqual(volume["usage_percent"], 100)
+        changed = self._receive()
+        self.assertEqual(changed["type"], "event")
+        self.assertEqual(changed["topic"], "msys.hal.storage.changed")
+        self.assertEqual(
+            changed["payload"]["state"]["volumes"][0]["total_bytes"],
+            volume["total_bytes"],
+        )
 
         unmounted = self._call("unmount", {"volume_id": "storage:sda1"})
         self.assertEqual(unmounted["type"], "return")
         self.assertFalse(unmounted["payload"]["volume"]["mounted"])
+        self.assertIsNone(unmounted["payload"]["volume"]["total_bytes"])
 
         configured = self._call("set_config", {"auto_mount": False})
         self.assertEqual(configured["type"], "return")
@@ -496,7 +538,7 @@ class NativeHalProtocolTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         report = json.loads(completed.stdout)
-        self.assertEqual(report["version"], "0.2.18")
+        self.assertEqual(report["version"], "0.2.19")
         self.assertTrue(report["ok"])
         self.assertTrue(report["wifi_control"])
         self.assertGreaterEqual(report["devices"], 8)

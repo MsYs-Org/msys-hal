@@ -30,6 +30,13 @@ not taken over. Command failures are returned as typed `HAL_STORAGE_*` errors,
 and the bounded state retains the command return code; success is never
 simulated.
 
+For a mounted volume below the validated managed root, the same bounded scan
+uses `statvfs` to report `total_bytes`, `available_bytes`, `free_bytes` (a
+compatibility alias), `used_bytes`, and integer `usage_percent`. `used_bytes`
+is `total_bytes - available_bytes`, so the values describe space available to
+ordinary applications. Capacity fields are `null` for unmounted volumes,
+mounts outside the managed root, or a failed/overflowing filesystem query.
+
 Automatic mounting is enabled by default and persisted atomically in
 `$MSYS_STATE_DIR/storage.json`. Set `MSYS_HAL_STORAGE_AUTOMOUNT=0` for a fresh
 installation default, or call `set_config`. A manual unmount is respected
@@ -47,7 +54,8 @@ Target `role:storage` or interface `org.msys.hal.storage.v1`:
 - `set_config({"auto_mount": true})` persists the auto-mount preference.
 
 The component publishes `msys.hal.storage.changed` only when its bounded state
-changes.
+changes. The event preserves its `revision` and numeric `volumes` fields and
+adds the complete current snapshot in `state`, including capacity values.
 
 The preferred event source is Linux `NETLINK_KOBJECT_UEVENT` filtered to the
 block subsystem. If opening it fails, one low-frequency refresh runs every 30

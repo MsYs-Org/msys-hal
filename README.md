@@ -15,6 +15,12 @@ separate `storage` role. A board-specific native provider is an
 ordinary language-neutral MSYS package and may outrank or be selected instead
 of one reference domain.
 
+Version 0.2.19 adds on-demand filesystem capacity to trusted, managed removable
+mounts. Storage snapshots and change events now carry `total_bytes`,
+`available_bytes`/`free_bytes`, `used_bytes`, and `usage_percent` without a new
+resident process or polling loop. Unmounted media, external mounts and failed
+`statvfs` reads report these fields as `null`.
+
 Version 0.2.18 adds transactional CH347 touch-affine calibration while retaining
 the `storage` role and
 `org.msys.hal.storage.v1` directly to the existing small C HAL process; it does

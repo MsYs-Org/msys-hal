@@ -22,6 +22,7 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -35,7 +36,7 @@
 #define O_NOFOLLOW 0
 #endif
 
-#define HAL_VERSION "0.2.18"
+#define HAL_VERSION "0.2.19"
 #define MANAGER_SCHEMA "org.msys.hal.manager.v1"
 #define NATIVE_SCHEMA "org.msys.hal.native-manager.v1"
 #define COMPONENT_ID "org.msys.hal.linux:native-manager"
@@ -185,6 +186,11 @@ typedef struct {
     char error_code[48];
     char error_reason[160];
     uint64_t size_bytes;
+    uint64_t total_bytes;
+    uint64_t available_bytes;
+    uint64_t used_bytes;
+    unsigned int usage_percent;
+    int capacity_available;
     int read_only;
     int mounted;
     int managed;
@@ -2128,6 +2134,49 @@ static int storage_source_usable(const char *path)
     return stat(path, &status) == 0 && (S_ISBLK(status.st_mode) || test_mode);
 }
 
+static int storage_statvfs_bytes(
+    uintmax_t blocks,
+    uintmax_t block_size,
+    uint64_t *output
+)
+{
+    if (block_size == 0u || blocks > UINT64_MAX / block_size) {
+        return 0;
+    }
+    *output = (uint64_t)(blocks * block_size);
+    return 1;
+}
+
+static void storage_read_capacity(StorageVolume *volume)
+{
+    struct statvfs status;
+    uintmax_t block_size;
+    uint64_t total;
+    uint64_t available;
+    if (!volume->mounted || !volume->managed || volume->mount_point[0] == '\0' ||
+        statvfs(volume->mount_point, &status) != 0) {
+        return;
+    }
+    block_size = status.f_frsize != 0u ? (uintmax_t)status.f_frsize : (uintmax_t)status.f_bsize;
+    if (!storage_statvfs_bytes((uintmax_t)status.f_blocks, block_size, &total) ||
+        !storage_statvfs_bytes((uintmax_t)status.f_bavail, block_size, &available)) {
+        return;
+    }
+    if (available > total) {
+        available = total;
+    }
+    volume->total_bytes = total;
+    volume->available_bytes = available;
+    volume->used_bytes = total - available;
+    volume->usage_percent = total == 0u ? 0u : (unsigned int)(
+        ((long double)volume->used_bytes * 100.0L / (long double)total) + 0.5L
+    );
+    if (volume->usage_percent > 100u) {
+        volume->usage_percent = 100u;
+    }
+    volume->capacity_available = 1;
+}
+
 static void storage_scan(StorageList *volumes)
 {
     const char *root = root_path("MSYS_HAL_BLOCK_ROOT", "/sys/class/block");
@@ -2225,6 +2274,7 @@ static void storage_scan(StorageList *volumes)
             size_t root_length = strlen(mount_root);
             volume->managed = strncmp(volume->mount_point, mount_root, root_length) == 0 &&
                 volume->mount_point[root_length] == '/';
+            storage_read_capacity(volume);
         }
         {
             char slug[MAX_NAME + 1];
@@ -4472,6 +4522,36 @@ static void append_storage_volume(JsonBuffer *buffer, const StorageVolume *volum
         volume->read_only ? "true" : "false",
         volume->mounted ? "true" : "false"
     );
+    buffer_append(buffer, ",\"total_bytes\":");
+    if (volume->capacity_available) {
+        buffer_format(buffer, "%" PRIu64, volume->total_bytes);
+    } else {
+        buffer_append(buffer, "null");
+    }
+    buffer_append(buffer, ",\"available_bytes\":");
+    if (volume->capacity_available) {
+        buffer_format(buffer, "%" PRIu64, volume->available_bytes);
+    } else {
+        buffer_append(buffer, "null");
+    }
+    buffer_append(buffer, ",\"free_bytes\":");
+    if (volume->capacity_available) {
+        buffer_format(buffer, "%" PRIu64, volume->available_bytes);
+    } else {
+        buffer_append(buffer, "null");
+    }
+    buffer_append(buffer, ",\"used_bytes\":");
+    if (volume->capacity_available) {
+        buffer_format(buffer, "%" PRIu64, volume->used_bytes);
+    } else {
+        buffer_append(buffer, "null");
+    }
+    buffer_append(buffer, ",\"usage_percent\":");
+    if (volume->capacity_available) {
+        buffer_format(buffer, "%u", volume->usage_percent);
+    } else {
+        buffer_append(buffer, "null");
+    }
     buffer_append(buffer, ",\"mount_point\":");
     if (volume->mounted && volume->mount_point[0] != '\0') {
         buffer_string(buffer, volume->mount_point);
@@ -4829,15 +4909,20 @@ static const char *dispatch_message(DispatchResult result)
 
 static void send_storage_changed(msys_mipc_client *client)
 {
-    char payload[128];
-    (void)snprintf(
-        payload,
-        sizeof(payload),
-        "{\"revision\":%" PRIu64 ",\"volumes\":%zu}",
+    JsonBuffer payload;
+    buffer_init(&payload);
+    buffer_format(
+        &payload,
+        "{\"revision\":%" PRIu64 ",\"volumes\":%zu,\"state\":",
         storage_revision,
         storage_cache.count
     );
-    (void)msys_mipc_send_event_json(client, "msys.hal.storage.changed", payload);
+    (void)append_storage_snapshot(&payload);
+    buffer_append(&payload, "}");
+    if (!payload.failed) {
+        (void)msys_mipc_send_event_json(client, "msys.hal.storage.changed", payload.data);
+    }
+    buffer_free(&payload);
 }
 
 static int process_call(msys_mipc_client *client, const char *packet)
