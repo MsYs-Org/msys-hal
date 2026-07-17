@@ -165,7 +165,11 @@ class NativeHalProtocolTests(unittest.TestCase):
         _write(wlan / "carrier", "1\n")
         _write(wlan / "mtu", "1500\n")
 
-        bluetooth = self.roots["MSYS_HAL_BLUETOOTH_ROOT"] / "hci0"
+        # Use a deliberately absent kernel index so this fixture remains
+        # deterministic even when the machine running the tests has a real
+        # hci0.  The native provider must never alias that real controller to
+        # this synthetic inventory entry.
+        bluetooth = self.roots["MSYS_HAL_BLUETOOTH_ROOT"] / "hci99"
         _write(bluetooth / "address", "02:00:00:00:00:02\n")
 
         rfkill_bt = self.roots["MSYS_HAL_RFKILL_ROOT"] / "rfkill0"
@@ -310,7 +314,7 @@ class NativeHalProtocolTests(unittest.TestCase):
         described = self._call("describe", {})
         self.assertEqual(described["type"], "return")
         self.assertEqual(described["payload"]["schema"], "org.msys.hal.native-manager.v1")
-        self.assertEqual(described["payload"]["provider"]["version"], "0.2.19")
+        self.assertEqual(described["payload"]["provider"]["version"], "0.2.20")
 
         first = self._call("inventory", {})["payload"]
         second = self._call("inventory", {})["payload"]
@@ -341,7 +345,7 @@ class NativeHalProtocolTests(unittest.TestCase):
         # rfkill soft=0 means only unblocked. With no registered Management
         # controller it must not be promoted to powered=true.
         _write(self.roots["MSYS_HAL_RFKILL_ROOT"] / "rfkill0" / "soft", "0\n")
-        bluetooth = self._call("get_state", {"id": "bluetooth:hci0"})["payload"]["state"]
+        bluetooth = self._call("get_state", {"id": "bluetooth:hci99"})["payload"]["state"]
         self.assertFalse(bluetooth["values"]["pairing_available"])
         self.assertEqual(bluetooth["values"]["pairing_reason"], "pairing-not-supported")
         self.assertIn(
@@ -538,7 +542,7 @@ class NativeHalProtocolTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         report = json.loads(completed.stdout)
-        self.assertEqual(report["version"], "0.2.19")
+        self.assertEqual(report["version"], "0.2.20")
         self.assertTrue(report["ok"])
         self.assertTrue(report["wifi_control"])
         self.assertGreaterEqual(report["devices"], 8)

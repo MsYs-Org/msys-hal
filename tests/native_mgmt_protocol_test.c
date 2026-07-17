@@ -150,6 +150,40 @@ int main(void)
     size_t response_length = 0u;
     int result;
 
+    /* Never alias a newly inserted hci1 to the sole existing hci0.  The old
+     * fallback produced a false powered state and prevented USB hotplug from
+     * executing its real registration path. */
+    {
+        unsigned char one_index[4] = {1u, 0u, 0u, 0u};
+        int selected = -1;
+        int selector_sockets[2];
+        if (socketpair(AF_UNIX, SOCK_DGRAM, 0, selector_sockets) != 0) {
+            return 15;
+        }
+        if (!send_complete(
+                selector_sockets[0],
+                MGMT_OP_READ_INDEX_LIST,
+                MSYS_HCI_DEV_NONE,
+                one_index,
+                sizeof(one_index)
+            ) || mgmt_controller_index(selector_sockets[1], 1, &selected) ||
+            strcmp(bluetooth_management_error, "index-missing:1") != 0) {
+            return 16;
+        }
+        if (!send_complete(
+                selector_sockets[0],
+                MGMT_OP_READ_INDEX_LIST,
+                MSYS_HCI_DEV_NONE,
+                one_index,
+                sizeof(one_index)
+            ) || !mgmt_controller_index(selector_sockets[1], 0, &selected) ||
+            selected != 0) {
+            return 17;
+        }
+        (void)close(selector_sockets[0]);
+        (void)close(selector_sockets[1]);
+    }
+
     if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sockets) != 0) {
         return 1;
     }

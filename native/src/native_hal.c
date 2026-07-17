@@ -36,7 +36,7 @@
 #define O_NOFOLLOW 0
 #endif
 
-#define HAL_VERSION "0.2.19"
+#define HAL_VERSION "0.2.20"
 #define MANAGER_SCHEMA "org.msys.hal.manager.v1"
 #define NATIVE_SCHEMA "org.msys.hal.native-manager.v1"
 #define COMPONENT_ID "org.msys.hal.linux:native-manager"
@@ -62,6 +62,7 @@
 #define MSYS_BTPROTO_HCI 1
 #define MSYS_HCI_DEV_NONE 0xffffu
 #define MSYS_HCI_CHANNEL_CONTROL 3u
+#define MSYS_HCIDEVUP _IOW('H', 201, int)
 #define MGMT_EV_CMD_COMPLETE 0x0001u
 #define MGMT_EV_CMD_STATUS 0x0002u
 #define MGMT_EV_DEVICE_FOUND 0x0012u
@@ -1321,10 +1322,6 @@ static int mgmt_controller_index(int descriptor, int preferred, int *selected)
             return 1;
         }
     }
-    if (count == 1u) {
-        *selected = read_le16(response + 2u);
-        return 1;
-    }
     bluetooth_error("index-missing", preferred);
     return 0;
 }
@@ -1703,7 +1700,60 @@ static int request_bluetooth_power(const char *interface, int powered)
         set_radio_power,
         bluetooth_wait_ms,
     };
-    return request_bluetooth_power_with(interface, powered, &operations);
+    int index;
+    int descriptor;
+    int flags;
+    int attempt;
+    char path[PATH_MAX];
+    char resolved[PATH_MAX];
+    BluetoothInfo info;
+
+    if (request_bluetooth_power_with(interface, powered, &operations)) {
+        return 1;
+    }
+    if (!powered || !bluetooth_index(interface, &index) ||
+        strncmp(bluetooth_management_error, "index-missing:", 14u) != 0 ||
+        !join_path(
+            path,
+            sizeof(path),
+            root_path("MSYS_HAL_BLUETOOTH_ROOT", "/sys/class/bluetooth"),
+            interface,
+            "device"
+        ) || realpath(path, resolved) == NULL || strstr(resolved, "/usb") == NULL) {
+        return 0;
+    }
+
+    /* A newly inserted USB controller may exist in the raw HCI inventory
+     * before it joins the Management index list.  HCIDEVUP is the normal
+     * registration edge for this USB-only state.  Never use it for WCNSS:
+     * Qualcomm setup devices require the rfkill path above and can otherwise
+     * remain permanently hidden from Management. */
+    descriptor = socket(MSYS_AF_BLUETOOTH, SOCK_RAW, MSYS_BTPROTO_HCI);
+    if (descriptor < 0) {
+        bluetooth_error("usb-socket", errno);
+        return 0;
+    }
+    flags = fcntl(descriptor, F_GETFD);
+    if (flags >= 0) {
+        (void)fcntl(descriptor, F_SETFD, flags | FD_CLOEXEC);
+    }
+    if (ioctl(descriptor, MSYS_HCIDEVUP, index) != 0 && errno != EALREADY) {
+        bluetooth_error("usb-device-up", errno);
+        (void)close(descriptor);
+        return 0;
+    }
+    (void)close(descriptor);
+    for (attempt = 0; attempt < 20; ++attempt) {
+        if (bluetooth_info(interface, &info)) {
+            if (info.powered || set_bluetooth_power(interface, 1)) {
+                return 1;
+            }
+            return 0;
+        }
+        bluetooth_wait_ms(50u);
+    }
+    bluetooth_error("usb-register-timeout", index);
+    return 0;
 }
 
 static int compare_names(const void *left, const void *right)

@@ -15,6 +15,11 @@ separate `storage` role. A board-specific native provider is an
 ordinary language-neutral MSYS package and may outrank or be selected instead
 of one reference domain.
 
+Version 0.2.20 keeps Bluetooth controller identity exact and registers a newly
+inserted USB `hciN` through the legacy device-up edge before retrying the Linux
+Management API.  That USB-only fallback is deliberately excluded for WCNSS so
+the embedded Qualcomm controller retains its rfkill recovery path.
+
 Version 0.2.19 adds on-demand filesystem capacity to trusted, managed removable
 mounts. Storage snapshots and change events now carry `total_bytes`,
 `available_bytes`/`free_bytes`, `used_bytes`, and `usage_percent` without a new
